@@ -12,7 +12,7 @@
 
 流程（与官方 CLI 一致）：
   1. 生成设备指纹 fingerprintId
-  2. POST https://www.codebuff.com/api/auth/cli/code → 拿 Google 登录 URL + fingerprintHash
+  2. POST https://freebuff.com/api/auth/cli/code → 拿登录 URL + fingerprintHash
   3. 授权链接打印 + 推送 TG，用户在浏览器打开并登录（脚本自动轮询）
   4. 轮询 /api/auth/cli/status → 成功拿到 user（含 authToken）
   5. authToken 保存到本地 / 推送 TG，之后直接作为 Bearer 调模型 API
@@ -41,7 +41,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-BASE_URL = "https://www.codebuff.com"
+# Freebuff 登录授权已迁移到 freebuff.com；模型/session API 仍由
+# www.codebuff.com 提供。两者不能混用（授权域的 API 后端会返回 404）。
+AUTH_BASE_URL = "https://freebuff.com"
+API_BASE_URL = "https://www.codebuff.com"
 CRED_FILE = Path(__file__).resolve().parent / "freebuff_credentials.json"
 POLL_INTERVAL = 5          # 秒，官方 CLI 用 5s
 POLL_TIMEOUT = 5 * 60      # 秒，官方 5 分钟
@@ -102,8 +105,9 @@ def mask_value(value):
 # HTTP helpers（标准库 urllib，无第三方依赖）
 # ---------------------------------------------------------------------------
 
-def _http(method: str, path: str, body=None, headers=None, query=None, timeout=REQUEST_TIMEOUT):
-    url = BASE_URL + path
+def _http(method: str, path: str, body=None, headers=None, query=None,
+          timeout=REQUEST_TIMEOUT, base_url=API_BASE_URL):
+    url = base_url + path
     if query:
         url += "?" + urllib.parse.urlencode(query)
     data = None
@@ -229,7 +233,10 @@ def cmd_login(args):
     fingerprint_id = args.fingerprint or gen_fingerprint()
     print(f"🚀 启动 Freebuff 登录流程（fingerprintId: {fingerprint_id}）...\n")
 
-    status, data, _ = _http("POST", "/api/auth/cli/code", {"fingerprintId": fingerprint_id})
+    status, data, _ = _http(
+        "POST", "/api/auth/cli/code", {"fingerprintId": fingerprint_id},
+        base_url=AUTH_BASE_URL,
+    )
     if status != 200 or not data:
         msg = f"❌ 请求登录 URL 失败: HTTP {status} {data}"
         print(msg)
@@ -270,7 +277,7 @@ def cmd_login(args):
         print("=" * 60)
         print("1️⃣  在浏览器打开下面这个链接：")
         print(f"    {login_url}")
-        print("2️⃣  用 Google 账号登录并授权")
+        print("2️⃣  用 Google 或 GitHub 账号登录并授权")
         print(f"3️⃣  脚本自动轮询等待，最多 {poll_timeout} 秒")
         print("=" * 60)
 
@@ -286,6 +293,7 @@ def cmd_login(args):
                 "fingerprintHash": fingerprint_hash,
                 "expiresAt": expires_at,
             },
+            base_url=AUTH_BASE_URL,
         )
         if status == 200 and data and data.get("user"):
             user = data["user"]

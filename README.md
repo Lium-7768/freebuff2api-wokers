@@ -75,7 +75,7 @@ Worker 通过 Cloudflare Workers 访问 Freebuff，上游通常会将请求识�
 
 ```bash
 curl https://你的worker.workers.dev/healthz
-# {"status":"ok","version":"1.4.0","time":"..."}
+# {"status":"ok","version":"1.8.5","time":"..."}
 ```
 
 - `version` 字段=当前部署的版本号，**每次部署版本号都会变化**，用于确认线上是否已更新（CF 边缘缓存有延迟，验证时等几秒或加随机参数）
@@ -100,7 +100,7 @@ freebuff 登录凭证（authToken）通过官方 CLI 同款**授权码轮询**�
 
 1. 仓库页面 → **Actions** → 左侧 **获取 Freebuff authToken** → **Run workflow**
 2. 可选填 `poll_timeout`（授权等待秒数，默认 300）和 `fingerprint`（留空自动生成）
-3. 你的 TG 会收到登录链接，浏览器打开并登录 Google 账号
+3. 你的 TG 会收到登录链接（来自 `freebuff.com`），浏览器打开并用 Google 或 GitHub 账号授权
 4. 脚本轮询到 token 后，完整 token 直接发到你 TG（Actions 日志里只有 `***`）
 5. 跑完自动清理旧运行记录，只保留最新 1 条
 
@@ -115,7 +115,7 @@ python3 extract_freebuff.py show    # 显示全部账号：邮箱 + token + 存�
 python3 extract_freebuff.py tgsend  # 测试 TG 连通性（配了 TG 时用）
 ```
 
-本地运行 `login` 时，每个账号会**分键追加**保存到 `freebuff_tools/freebuff_credentials.json`（不覆盖已有账号，支持 Google / GitHub 登录，均自动记录）。该文件已被 `.gitignore` 忽略，不会提交到 GitHub；结构参考 `freebuff_tools/freebuff_credentials.example.json`。
+本地运行 `login` 时，每个账号会**分键追加**保存到 `freebuff_tools/freebuff_credentials.json`（不覆盖已有账号，支持 Google / GitHub 登录，均自动记录）。授权页面使用 `https://freebuff.com`，模型 API 仍使用 `https://www.codebuff.com`。该文件已被 `.gitignore` 忽略，不会提交到 GitHub；结构参考 `freebuff_tools/freebuff_credentials.example.json`。
 
 其他实用命令：
 
@@ -302,5 +302,4 @@ Worker 已自动处理以上全部生命周期，无需手动干预。另：syst
 ## 📄 License
 
 本项目采用 [MIT License](LICENSE)，欢迎自由使用、修改与分享。
-
 
