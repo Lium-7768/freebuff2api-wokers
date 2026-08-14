@@ -7,15 +7,15 @@
 
 把 **freebuff/codebuff** 的免费模型暴露成 **OpenAI-compatible API**。单文件无依赖，**推荐 Docker 容器部署**（或自建 VPS 运行），适配任意 OpenAI SDK / 客户端（QwenPaw、Hermes、ChatGPT-Next-Web、LobeChat、one-api 等）。
 
-> ⚠️ **部署方式重要提示**：Freebuff 官方已检测 Cloudflare Worker 部署（识别 `cf-worker` / `cf-ray` 等边缘标记），**在 CF 上部署会显著增加账号被封禁的风险**。因此本项目**不推荐 Cloudflare 部署**，推荐使用 **Docker 容器**或自建 VPS 运行（见下方「[🐳 Docker 容器化部署](#-docker-容器化部署-推荐)」）。
+> ⚠️ **部署方式重要提示**：Freebuff 官方已检测 Cloudflare Worker 部署（识别 `cf-worker` / `cf-ray` 等边缘标记）。自建 VPS 可以去掉 Cloudflare Worker 的边缘标记，但 VPS 出口仍可能被识别为 hosting 网络，不能保证绕过上游的地区、IP、账号或第三方客户端门控。
 
 ## ✨ 特性
 
-- ⭐ **完整访问模式模型**：Cloudflare Workers 默认使用美国出口，通常可获得 Freebuff 完整访问模式；其中 DeepSeek V4 Flash 和 MiMo 2.5 属于官方特殊的非 Premium 模型
+- ⭐ **VPS/Docker 运行**：通过本地 Node.js 服务运行适配层，不依赖 Cloudflare 或 Vercel
 - 🔒 **常规模型基础额度**：除上述两个特殊模型外，普通模型按每日 6 次 session 的基础额度理解；不会宣传为无限量
 - 🔁 **多账号自动切换**：撞额度自动冷却并切换，逗号分隔即可
 - 💡 **优先复用活跃 session**：一个 session 约 1 小时有效，创建 session 才扣额度；只要当前模型的 session 还活跃就钉在同一账号上，用满再换，最大化额度利用率
-- 📢 **广告与 streak 流程兼容**：创建新 session 前，Worker 会按官方客户端流程请求广告，并调用 `GET /api/v1/freebuff/streak` 尝试签到；相关请求失败会静默跳过，不阻塞聊天
+- 🧭 **协议诊断优先**：不伪造广告、设备或工具签名；保留官方 session、run 和 chat 生命周期
 - 🧩 **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`（流式/非流式视接口支持情况而定）
 - 📨 **Anthropic Messages API**：支持 `/v1/messages`、`/messages` 及对应的 `count_tokens` 路由，可供 Anthropic SDK / 兼容客户端尝试接入
 - ❤️ **健康检查**：`GET /healthz`（免鉴权），方便监控探活
@@ -133,7 +133,7 @@ python3 extract_freebuff.py chat "你好"      # 发一条消息测试模型 API
 
 ### 🐳 Docker 容器化部署（✅ 推荐）
 
-> 适合本地/NAS/VPS 长期运行：不受 Cloudflare Workers 限制，**不会暴露 CF 边缘标记**（`cf-worker` / `cf-ray`），账号封禁风险显著低于 CF 部署；同一套代码也可在 CF 运行（不推荐）。
+> 适合本地/NAS/VPS 长期运行：不依赖 Cloudflare Workers。VPS 不会产生 Cloudflare Worker 专属的 `cf-worker` / `cf-ray` 标记，但其云厂商出口仍可能被上游识别为 hosting 网络。
 
 **快速部署：**
 
@@ -156,7 +156,9 @@ chmod 600 .env credentials/*.json
 docker compose up -d --build
 ```
 
-启动后监听 `0.0.0.0:8787`（compose 映射到宿主机 `8877`），Base URL 为 `http://localhost:8877/v1`。
+启动后容器监听 `0.0.0.0:8787`，compose 默认只将宿主机 `127.0.0.1:8877` 映射给本机，建议通过 Caddy/Nginx 提供 HTTPS；Base URL 为 `https://你的域名/v1`。
+
+Dockerfile 会把当前 checkout 的 `worker.js` 固定进镜像，启动时不会再从 GitHub 远程覆盖代码。
 
 **环境变量：**
 
@@ -168,7 +170,7 @@ docker compose up -d --build
 | `CODEBUFF_API` | 上游地址，默认空=直连 `https://www.codebuff.com`；走自建中继时设为中继域名 |
 | `RELAY_KEY` | 中继密钥（`CODEBUFF_API` 指向带鉴权的中继时必填） |
 
-> ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。
+> ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取 `authToken`。请仅使用你有权使用的账号，并妥善保护凭证文件和本地代理密钥。
 
 ### Cloudflare Worker 部署（❌ 不推荐）
 
@@ -362,5 +364,4 @@ Worker 已自动处理以上全部生命周期，无需手动干预。另：syst
 ## 📄 License
 
 本项目采用 [AGPL-3.0 License](LICENSE)。本项目参考并改写了 [freebuff2api](https://github.com/XxxXTeam/freebuff2api) 的部分代码与结构（原项目为 AGPL-3.0），因此本项目同样以 AGPL-3.0 开源；使用时请保留原版权声明，欢迎自由使用、修改与分享。
-
 

@@ -1,16 +1,15 @@
-version: "3.8"
-
 services:
   freebuff2api:
-    image: ${DOCKERHUB_USERNAME}/freebuff2api:latest
+    build: .
+    image: freebuff2api:local
     container_name: freebuff2api
     restart: unless-stopped
     ports:
-      - "8877:8787"
+      - "127.0.0.1:8877:8787"
     environment:
       - PORT=8787
       - HOST=0.0.0.0
-      # 上游地址：默认空=直连官方 www.codebuff.com；如走自建中继可设为中继域名
+      # 上游地址：默认空=直连官方 www.codebuff.com
       - CODEBUFF_API=
       - RELAY_KEY=${RELAY_KEY}
       - FREEBUFF_API_KEY=${FREEBUFF_API_KEY}

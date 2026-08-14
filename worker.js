@@ -1,4 +1,9 @@
-const CODEBUFF_API = "https://www.codebuff.com";
+const DEFAULT_CODEBUFF_API = "https://www.codebuff.com";
+let configuredCodebuffApi = DEFAULT_CODEBUFF_API;
+
+function codebuffApi() {
+  return configuredCodebuffApi;
+}
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_API_KEY = "freebuff-default-key";
 const VERSION = "1.8.9";
@@ -362,19 +367,9 @@ const STANDARD_MODELS = new Set([
   "mimo/mimo-v2.5",
 ]);
 
-// ---------------------------------------------------------------------------
-// 桌面版协议常量（逆向自 Freebuff Desktop orchestrator.js）
-// 桌面版 = multi-session 模式（每 tab 一个实例），与 CLI 单会话区分。
-// ⚠️ 实测（2026-08-10）：multi-session 创建的实例 chat 报 428 waiting_room_required
-// （服务端 chat gate 不识别多会话实例），因此 POST 实际用单会话但保留
-// 预生成 instance-id 的桌面版签名。include-unused-rate-limits 是浏览器/
-// 模型选择器用的额度快照头，GET 探测时带它没问题。
-// ---------------------------------------------------------------------------
-const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "1" };
-
-
 export default {
   async fetch(request, env) {
+    configuredCodebuffApi = String(env.CODEBUFF_API || DEFAULT_CODEBUFF_API).replace(/\/$/, "");
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
@@ -738,7 +733,7 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
   if (body !== undefined) headers["Content-Type"] = "application/json";
   Object.assign(headers, extraHeaders);
 
-  const resp = await fetch(CODEBUFF_API + path, {
+  const resp = await fetch(codebuffApi() + path, {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -834,78 +829,8 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
 // session 生命周期
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// 正常客户端行为层（v1.8.8.1，源码依据：官方 cli/src/hooks/use-gravity-ad.ts、
-// cli/src/utils/fingerprint.ts、sdk/src/impl/llm.ts）
-//   - 稳定指纹：每个 Worker（账号）一个永不变化的 fingerprintId（enhanced- 前缀，
-//     官方用硬件序列号/MAC/机器ID 哈希；CF 无硬件，用 token 派生稳定哈希即可，
-//     关键是"同一账号永远同一指纹"）
-//   - 广告链：官方免费推理靠广告（源码注释原话），每次会话前 POST /ads 拉取 +
-//     POST /ads/impression 上报曝光，失败静默
-//   - usage 触碰：官方客户端启动会查 /api/v1/usage，补上让调用面更完整
-// ---------------------------------------------------------------------------
-const BEHAVIOR_CACHE_TTL_MS = 30 * 60 * 1000; // 30 分钟
-const behaviorCache = new Map(); // key -> ts
-
-function behaviorDue(key) {
-  const ts = behaviorCache.get(key) || 0;
-  if (Date.now() - ts > BEHAVIOR_CACHE_TTL_MS) {
-    behaviorCache.set(key, Date.now());
-    return true;
-  }
-  return false;
-}
-
-// 稳定指纹：token 派生，同一账号永远一致（官方 enhanced- 前缀 + 哈希）
-// CF Workers 无同步 WebCrypto，用轻量确定性哈希（FNV-1a 双种子 + hex）
-function stableFingerprint(token) {
-  let h1 = 0x811c9dc5, h2 = 0x01000193;
-  const s = "freebuff-fp-v2:" + token;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
-    h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0;
-  }
-  return "enhanced-" + h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
-}
-
-// 广告链：POST /ads 拉取 → 若有 impUrl 则 POST /ads/impression 上报曝光。
-// 官方实现：getCliAdRequestUserAgent 发 Freebuff-CLI/<version> UA；
-// body {provider:"gravity", surface, sessionId, device, userAgent}；曝光 {impUrl, mode}
-async function runNormalClientBehavior(token, clientFingerprint) {
-  const failures = [];
-  // 1) 广告拉取 + 曝光（每 30 分钟一次，避免每个请求都打广告接口）
-  if (behaviorDue("ads:" + token)) {
-    try {
-      const ad = await enqueueUp("POST", "/api/v1/ads", token, {
-        provider: "gravity",
-        sessionId: crypto.randomUUID(),
-        surface: "waiting_room",
-        device: { os: "macos", timezone: "Asia/Shanghai", locale: "zh-CN" },
-        userAgent: "Freebuff-CLI/0.0.138",
-      }, { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
-      const impUrl = ad.data && Array.isArray(ad.data.ads) && ad.data.ads[0] && ad.data.ads[0].impUrl;
-      if (ad.status === 200 && impUrl) {
-        await enqueueUp("POST", "/api/v1/ads/impression", token,
-          { impUrl, mode: "free" },
-          { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
-      }
-    } catch (e) { failures.push("ads:" + String(e && e.message || e).slice(0, 80)); }
-  }
-  // 2) usage 触碰（30 分钟一次）
-  if (behaviorDue("usage:" + token)) {
-    try {
-      await enqueueUp("POST", "/api/v1/usage", token,
-        { fingerprintId: clientFingerprint },
-        { "Content-Type": "application/json" }, 6000);
-    } catch (e) { failures.push("usage:" + String(e && e.message || e).slice(0, 80)); }
-  }
-  return failures;
-}
-
 async function createSession(token, sessionModel, forceCreate = false) {
-  // 0) 正常客户端行为：广告链 + usage 触碰（30 分钟节流，失败静默）
-  try { await runNormalClientBehavior(token, stableFingerprint(token)); } catch {}
+  // 只复用本进程仍然有效的同一模型 session；不伪造广告、设备或使用轨迹。
   // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
   if (!forceCreate) {
     const cached = sessCache.get(token + ":" + sessionModel);
@@ -915,11 +840,10 @@ async function createSession(token, sessionModel, forceCreate = false) {
     if (cached) sessCache.delete(token + ":" + sessionModel);
   }
   // 1) 查上游当前 session，同模型直接复用（forceCreate 时跳过：僵尸 active session 会被 GET 反复复用，
-  //    导致 chat 一直 428；强制 POST 拿全新实例）
-  //    桌面版签名：GET 带 include-unused-rate-limits（模型选择器额度快照头）
+  //    导致 chat 一直 428；强制 POST 拿全新实例）。GET 使用 CLI 的普通请求形态。
   if (!forceCreate) {
     const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
-      DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
+      undefined, SESSION_TIMEOUT_MS);
     recordAccountObservation(token, cur.status, cur.data, {
       quota: cur.data?.rateLimitsByModel || null,
       uid: cur.data?.uid || null,
@@ -937,13 +861,9 @@ async function createSession(token, sessionModel, forceCreate = false) {
   }
 
 
-  // 2) create（可能 queue）。桌面版签名：POST 带预生成 x-freebuff-instance-id（客户端 UUID）。
-  //    ⚠️ 实测（2026-08-10）：multi-session:1 创建的实例 chat 报 428 waiting_room_required
-  //    （服务端 chat gate 不识别多会话实例），所以这里用单会话 + 预生成 instance-id：
-  //    既保留桌面版客户端预生成实例的指纹，又确保 chat 能被识别。
-  const instId = crypto.randomUUID();
+  // 2) create（可能 queue）。官方 CLI 的 POST 只发送模型头；实例 ID 由服务端生成。
   const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
-    { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
+    { "x-freebuff-model": sessionModel }, SESSION_TIMEOUT_MS);
   recordAccountObservation(token, r.status, r.data, {
     quota: r.data?.rateLimitsByModel || null,
     uid: r.data?.uid || null,
@@ -1001,23 +921,19 @@ async function finishRun(token, runId, totalSteps) {
     { action: "FINISH", runId, status: "completed", totalSteps, directCredits: 0, totalCredits: 0 }, undefined, SESSION_TIMEOUT_MS);
 }
 
-// deepseek 等直接模型：主 run + context-pruner 子 run
-// 精简版：只 START 两个 run（chat 只校验 run_id 存在，recordStep/finishRun 可跳过），
-// 实测链路总耗时 4s 内（原版 8s），满足 qwenpaw check_model_connection 5s 超时
-const runCache = new Map();   // `${token}:${agentId}` -> { runId, childRunId, ts }
-const RUN_CACHE_TTL_MS = 10 * 60 * 1000; // 实测 run_id 可跨请求复用（上游只校验存在性），10min 缓存省两次上游调用
-
 async function startRunChain(token, agentId) {
-  const key = token + ":" + agentId;
-  const hit = runCache.get(key);
-  if (hit && Date.now() - hit.ts < RUN_CACHE_TTL_MS) {
-    return { runId: hit.runId, agentId, startedAt: utcNow(), childRunId: hit.childRunId, cached: true };
-  }
   const startedAt = utcNow();
   const runId = await startRun(token, agentId);
   const childRunId = await startRun(token, CONTEXT_PRUNER_AGENT, [runId]);
-  runCache.set(key, { runId, childRunId, ts: Date.now() });
   return { runId, agentId, startedAt, childRunId, cached: false };
+}
+
+async function finishRunChain(token, chain, totalSteps = 1) {
+  if (!chain) return;
+  // Finish the child first, then its ancestor. Best-effort cleanup must never
+  // replace a successful model response with an analytics failure.
+  if (chain.childRunId) await finishRun(token, chain.childRunId, totalSteps).catch(() => {});
+  if (chain.runId) await finishRun(token, chain.runId, totalSteps).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,7 +1023,11 @@ function normalizeReasoningEffort(model, effort) {
   return clamped === String(effort) ? effort : clamped;
 }
 
-function buildUpstreamPayload(params, mc, sess, runId) {
+function newClientSessionId() {
+  return crypto.randomUUID().replaceAll("-", "").slice(0, 13);
+}
+
+function buildUpstreamPayload(params, mc, sess, runId, clientSessionId) {
   const payload = {};
   for (const k of UPSTREAM_KEYS) if (params[k] !== undefined && params[k] !== null) payload[k] = params[k];
   // reasoning_effort 按官方模型 efforts 表 clamp-down（不拒绝、不换模型）
@@ -1119,27 +1039,13 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   payload.stream = true;
   if (!payload.stop) payload.stop = ['"cb_easp"'];
   payload.provider = { data_collection: "deny" };
-  // 工具集签名：Freebuff 对「带 tools 但无官方专属工具名」的请求会判定为
-  // foreign_toolset 并拒绝/降级模型（表现为工具调用被限制）。end_turn 是官方
-  // TOOLS_WHICH_WONT_FORCE_NEXT_STEP 白名单里的无害工具，混入它能让带工具的
-  // 请求通过校验；end_turn 不会被模型实际调用，只用于工具集合签名。
-  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
-    const hasSignature = payload.tools.some(
-      (t) => t && typeof t === "object" && t.function && typeof t.function.name === "string" && t.function.name === "end_turn",
-    );
-    if (!hasSignature) {
-      payload.tools = [
-        ...payload.tools,
-        { type: "function", function: { name: "end_turn", description: "Signal the end of the current task.", parameters: { type: "object", properties: {} } } },
-      ];
-    }
-  }
   payload.codebuff_metadata = {
     freebuff_instance_id: sess.instanceId,
     trace_session_id: crypto.randomUUID(),
     run_id: runId,
-    // 官方 SDK：client_id = clientSessionId（会话级稳定标识），不是随机数
-    client_id: stableFingerprint(runId || "session"),
+    // Official SDK semantics: client_id is the per-prompt client session id.
+    // Do not substitute a hardware fingerprint or a reused run id here.
+    client_id: clientSessionId,
     cost_mode: "free",
   };
   return payload;
@@ -1171,7 +1077,7 @@ function buildReviewerMessages(params) {
   return messages;
 }
 
-function buildReviewerPayload(params, mc, sess, reviewerRunId) {
+function buildReviewerPayload(params, mc, sess, reviewerRunId, clientSessionId) {
   const metadata = params.metadata && typeof params.metadata === "object"
     ? { ...params.metadata }
     : undefined;
@@ -1192,6 +1098,7 @@ function buildReviewerPayload(params, mc, sess, reviewerRunId) {
     mc,
     sess,
     reviewerRunId,
+    clientSessionId,
   );
 }
 
@@ -1350,21 +1257,25 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     let rootRunId = null;
     let reviewerRunId = null;
+    let rootRunChain = null;
     try {
       const sess = await createSession(token, mc.session);
       const root = await startRunChain(token, mc.root_agent || mc.agent);
+      rootRunChain = root;
       rootRunId = root.runId;
       // Desktop 协议的关键：reviewer 是 root run 的子 run。
       reviewerRunId = await startRun(token, reviewerAgent, [rootRunId]);
       if (debug) console.log(`[review][acct ${acctTry + 1}] root=${rootRunId} reviewer=${reviewerRunId} model=${reviewerModel}`);
 
-      const payload = buildReviewerPayload(chatParams, { ...mc, upstream: reviewerModel }, sess, reviewerRunId);
+      const clientSessionId = newClientSessionId();
+      const payload = buildReviewerPayload(chatParams, { ...mc, upstream: reviewerModel }, sess, reviewerRunId, clientSessionId);
       const headers = {
         Authorization: "Bearer " + token,
         "Content-Type": "application/json",
+        "User-Agent": "ai-sdk/openai-compatible/0.0.149/codebuff",
         "x-freebuff-instance-id": sess.instanceId,
       };
-      const resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
+      const resp = await fetch(codebuffApi() + "/api/v1/chat/completions", {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
@@ -1383,7 +1294,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         if (finalized) return;
         finalized = true;
         if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-        if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+        await finishRunChain(token, rootRunChain, 1);
       };
 
       if (isStream) {
@@ -1405,7 +1316,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       console.error("[code_review]", e);
       lastErrMsg = String(e.message || e);
       if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-      if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+      await finishRunChain(token, rootRunChain, 1);
       if (/start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg)) cooldown(token, 60 * 1000);
     }
   }
@@ -1422,12 +1333,15 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
   // 请求内多号重试：一个号失败（超时/429/428 重建无效/run 失败）立即冷却并换下一个号，最多试完整个账号池。
   // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
   let lastErrMsg = "";
+  let lastStatus = 502;
+  const clientSessionId = newClientSessionId();
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
     const acct = pickToken(env, mc.session);
     const token = acct ? acct.token : null;
     if (!token) break;
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
+    let finishCurrentRun = async () => {};
     try {
       // 1) session
       const sess = await createSession(token, mc.session);
@@ -1436,15 +1350,22 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       // 2) run 链
       const run = await startRunChain(token, mc.agent);
       if (debug) console.log(`[acct ${acctTry + 1}] run=${run.runId}`);
+      let runFinalized = false;
+      finishCurrentRun = async () => {
+        if (runFinalized) return;
+        runFinalized = true;
+        await finishRunChain(token, run, 1);
+      };
 
       // 3) chat（428 waiting_room_required / 409 session_superseded = session 失效，
       //    清缓存强制重建后重试一次；仍失败则冷却该号交给外层换号）
       let resp, errText = "", sessForChat = sess;
       for (let attempt = 0; attempt < 2; attempt++) {
-        const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId);
+        const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId, clientSessionId);
         const headers = {
           Authorization: "Bearer " + token,
           "Content-Type": "application/json",
+          "User-Agent": "ai-sdk/openai-compatible/0.0.149/codebuff",
           "x-freebuff-instance-id": sessForChat.instanceId,
         };
         // x-freebuff-acting-user-id：⚠️ 实测（2026-08-10）不带它 chat 才能过（200），
@@ -1459,8 +1380,8 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         };
         try {
           resp = isStream
-            ? await fetchStreamWithQuotaGuard(CODEBUFF_API + "/api/v1/chat/completions", chatInit, token, mc.session)
-            : await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
+            ? await fetchStreamWithQuotaGuard(codebuffApi() + "/api/v1/chat/completions", chatInit, token, mc.session)
+            : await fetch(codebuffApi() + "/api/v1/chat/completions", {
                 ...chatInit,
                 signal: AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
               });
@@ -1480,6 +1401,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
           break;
         }
         errText = await resp.text();
+        lastStatus = resp.status;
         recordAccountObservation(token, resp.status, errText);
         // 428 waiting_room_required（无活跃 session）/ 409 session_superseded（被新 session 顶替）
         // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却
@@ -1500,24 +1422,33 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       }
       if (!resp.ok) {
         lastErrMsg = "upstream error: " + (errText || "").slice(0, 300);
+        await finishCurrentRun();
         if (debug) console.log(`[acct ${acctTry + 1}] failed ${resp.status}, switch account`);
         continue;
       }
 
       if (isStream) {
         const { readable, writable } = new TransformStream();
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc);
-        else pipeUpstreamToClient(resp.body, writable);
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finishCurrentRun);
+        else pipeUpstreamToClient(resp.body, writable, finishCurrentRun);
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
-      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc), 200);
+      if (mode === "responses") {
+        const result = await responsesToNonStream(resp.body, mc);
+        await finishCurrentRun();
+        return jsonResponse(result, 200);
+      }
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
+      await finishCurrentRun();
       return jsonResponse(agg, 200);
     } catch (e) {
       console.error("[" + mode + "]", e);
+      await finishCurrentRun();
       const msg = String(e.message || e);
+      const statusMatch = msg.match(/\b(?:failed|error|upstream error:)\s*:?\s*(4\d{2}|5\d{2})\b/i);
+      if (statusMatch) lastStatus = Number(statusMatch[1]);
       // 额度探测确认耗尽：清除当前模型 session，按上游 retryAfterMs 冷却后切号。
       if (e instanceof QuotaExhaustedError) {
         sessCache.delete(token + ":" + mc.session);
@@ -1536,7 +1467,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
     }
   }
-  return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502);
+  return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, lastStatus);
 }
 
 
@@ -2092,11 +2023,6 @@ function cleanCache() {
       for (const [k, v] of sessCache) {
         const exp = v.expiresAt ? new Date(v.expiresAt).getTime() : 0;
         if (exp > 0 && exp < now) sessCache.delete(k);
-      }
-    }
-    if (runCache.size > 50) {
-      for (const [k, v] of runCache) {
-        if (now - v.ts > RUN_CACHE_TTL_MS) runCache.delete(k);
       }
     }
   } catch {}

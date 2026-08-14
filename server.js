@@ -44,7 +44,7 @@ const env = {
   RELAY_KEY: process.env.RELAY_KEY || '',
 };
 
-console.log(`[server] start: ${tokenLines.length} tokens, apiKey=${env.FREEBUFF_API_KEY.slice(0,8)}..., debug=${env.FREEBUFF_DEBUG}`);
+console.log(`[server] start: ${tokenLines.length} tokens, apiKeyConfigured=${Boolean(process.env.FREEBUFF_API_KEY)}, debug=${env.FREEBUFF_DEBUG}`);
 if (env.CODEBUFF_API) console.log(`[server] CODEBUFF_API=${env.CODEBUFF_API}`);
 if (env.RELAY_KEY) console.log(`[server] RELAY_KEY set`);
 
