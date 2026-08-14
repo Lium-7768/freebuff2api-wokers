@@ -40,6 +40,8 @@ const env = {
   FREEBUFF_TOKEN: tokenLines.join(','),
   FREEBUFF_API_KEY: process.env.FREEBUFF_API_KEY || 'freebuff-default-key',
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
+  FREEBUFF_ADS_MODE: process.env.FREEBUFF_ADS_MODE || 'fetch',
+  FREEBUFF_CLI_VERSION: process.env.FREEBUFF_CLI_VERSION || '0.0.149',
   CODEBUFF_API: process.env.CODEBUFF_API || '',
   RELAY_KEY: process.env.RELAY_KEY || '',
 };

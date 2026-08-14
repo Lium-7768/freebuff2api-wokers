@@ -15,7 +15,7 @@
 - 🔒 **常规模型基础额度**：除上述两个特殊模型外，普通模型按每日 6 次 session 的基础额度理解；不会宣传为无限量
 - 🔁 **多账号自动切换**：撞额度自动冷却并切换，逗号分隔即可
 - 💡 **优先复用活跃 session**：一个 session 约 1 小时有效，创建 session 才扣额度；只要当前模型的 session 还活跃就钉在同一账号上，用满再换，最大化额度利用率
-- 🧭 **协议诊断优先**：不伪造广告、设备或工具签名；保留官方 session、run 和 chat 生命周期
+- 🧭 **协议诊断优先**：usage 按官方 `cli-usage` 语义，可选按官方字段请求广告；不伪造 impression 或工具签名
 - 🧩 **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`（流式/非流式视接口支持情况而定）
 - 📨 **Anthropic Messages API**：支持 `/v1/messages`、`/messages` 及对应的 `count_tokens` 路由，可供 Anthropic SDK / 兼容客户端尝试接入
 - ❤️ **健康检查**：`GET /healthz`（免鉴权），方便监控探活
@@ -167,6 +167,8 @@ Dockerfile 会把当前 checkout 的 `worker.js` 固定进镜像，启动时不�
 | `PORT` / `HOST` | 监听端口/地址，默认 `8787` / `0.0.0.0` |
 | `FREEBUFF_API_KEY` | 本 API 访问 key（缺省 `freebuff-default-key`） |
 | `FREEBUFF_DEBUG` | `true` 开启请求级调试日志 |
+| `FREEBUFF_ADS_MODE` | `fetch` 时按官方字段请求广告，但不会伪造曝光；默认 `fetch`，设为 `off` 可关闭 |
+| `FREEBUFF_CLI_VERSION` | 广告请求的 CLI 版本标识，默认 `0.0.149` |
 | `CODEBUFF_API` | 上游地址，默认空=直连 `https://www.codebuff.com`；走自建中继时设为中继域名 |
 | `RELAY_KEY` | 中继密钥（`CODEBUFF_API` 指向带鉴权的中继时必填） |
 
@@ -364,4 +366,3 @@ Worker 已自动处理以上全部生命周期，无需手动干预。另：syst
 ## 📄 License
 
 本项目采用 [AGPL-3.0 License](LICENSE)。本项目参考并改写了 [freebuff2api](https://github.com/XxxXTeam/freebuff2api) 的部分代码与结构（原项目为 AGPL-3.0），因此本项目同样以 AGPL-3.0 开源；使用时请保留原版权声明，欢迎自由使用、修改与分享。
-

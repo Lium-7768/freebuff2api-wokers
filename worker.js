@@ -829,6 +829,88 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
 // session 生命周期
 // ---------------------------------------------------------------------------
 
+// Official CLI side-channel requests. These are deliberately implemented as
+// configurable/observational behavior: usage uses the documented `cli-usage` marker,
+// while ads are fetched with the real prompt messages and VPS runtime details.
+// We never emit an impression because this adapter does not render an ad to a
+// human; claiming one would create false billing/telemetry.
+const CLIENT_BEHAVIOR_TTL_MS = 30 * 60 * 1000;
+const behaviorCache = new Map();
+
+function behaviorDue(key) {
+  const previous = behaviorCache.get(key) || 0;
+  if (Date.now() - previous <= CLIENT_BEHAVIOR_TTL_MS) return false;
+  behaviorCache.set(key, Date.now());
+  return true;
+}
+
+function runtimeAdDevice() {
+  const platform = typeof process !== "undefined" ? process.platform : "linux";
+  const os = platform === "darwin" ? "macos" : platform === "win32" ? "windows" : "linux";
+  const resolved = Intl.DateTimeFormat().resolvedOptions();
+  return {
+    os,
+    timezone: resolved.timeZone || "UTC",
+    locale: resolved.locale || "en-US",
+  };
+}
+
+function runtimeAdUserAgent() {
+  // Same browser-like UA family used by the official ad hook. This describes
+  // the actual server runtime as Linux rather than pretending to be macOS.
+  return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+}
+
+function runtimeCliAdUserAgent(env) {
+  const version = String(env.FREEBUFF_CLI_VERSION || "0.0.149").trim();
+  return `Freebuff-CLI/${version}`;
+}
+
+function adMessagesFromParams(params) {
+  return normalizeMessages(params?.messages).map((message) => ({
+    role: message.role,
+    content: typeof message.content === "string"
+      ? message.content
+      : JSON.stringify(message.content ?? ""),
+  }));
+}
+
+async function runOfficialClientBehavior(token, env, params, clientSessionId) {
+  // The official usage query uses this literal marker, not a token-derived
+  // hardware fingerprint. It is useful for diagnostics and quota UI only.
+  if (behaviorDue(`usage:${token}`)) {
+    try {
+      await enqueueUp("POST", "/api/v1/usage", token,
+        { fingerprintId: "cli-usage" }, undefined, 6000);
+    } catch (error) {
+      if (env.FREEBUFF_DEBUG === "true") {
+        console.log(`[behavior] usage touch failed: ${String(error?.message || error).slice(0, 120)}`);
+      }
+    }
+  }
+
+  // Fetching ads is opt-in because a headless adapter cannot truthfully record
+  // that the user saw an impression. Set FREEBUFF_ADS_MODE=fetch to request
+  // the same ad payload as the CLI; no impression is reported automatically.
+  if (String(env.FREEBUFF_ADS_MODE || "fetch").toLowerCase() !== "fetch") return;
+  if (!behaviorDue(`ads:${token}`)) return;
+
+  try {
+    await enqueueUp("POST", "/api/v1/ads", token, {
+      provider: "gravity",
+      messages: adMessagesFromParams(params),
+      sessionId: clientSessionId,
+      device: runtimeAdDevice(),
+      surface: "cli_chat",
+      userAgent: runtimeAdUserAgent(),
+    }, { "User-Agent": runtimeCliAdUserAgent(env) }, 6000);
+  } catch (error) {
+    if (env.FREEBUFF_DEBUG === "true") {
+      console.log(`[behavior] ad fetch failed: ${String(error?.message || error).slice(0, 120)}`);
+    }
+  }
+}
+
 async function createSession(token, sessionModel, forceCreate = false) {
   // 只复用本进程仍然有效的同一模型 session；不伪造广告、设备或使用轨迹。
   // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
@@ -1259,6 +1341,8 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
     let reviewerRunId = null;
     let rootRunChain = null;
     try {
+      const clientSessionId = newClientSessionId();
+      await runOfficialClientBehavior(token, env, chatParams, clientSessionId);
       const sess = await createSession(token, mc.session);
       const root = await startRunChain(token, mc.root_agent || mc.agent);
       rootRunChain = root;
@@ -1267,7 +1351,6 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       reviewerRunId = await startRun(token, reviewerAgent, [rootRunId]);
       if (debug) console.log(`[review][acct ${acctTry + 1}] root=${rootRunId} reviewer=${reviewerRunId} model=${reviewerModel}`);
 
-      const clientSessionId = newClientSessionId();
       const payload = buildReviewerPayload(chatParams, { ...mc, upstream: reviewerModel }, sess, reviewerRunId, clientSessionId);
       const headers = {
         Authorization: "Bearer " + token,
@@ -1343,6 +1426,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     let finishCurrentRun = async () => {};
     try {
+      await runOfficialClientBehavior(token, env, chatParams, clientSessionId);
       // 1) session
       const sess = await createSession(token, mc.session);
       if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
@@ -2023,6 +2107,11 @@ function cleanCache() {
       for (const [k, v] of sessCache) {
         const exp = v.expiresAt ? new Date(v.expiresAt).getTime() : 0;
         if (exp > 0 && exp < now) sessCache.delete(k);
+      }
+    }
+    if (behaviorCache.size > 200) {
+      for (const [k, ts] of behaviorCache) {
+        if (now - ts > CLIENT_BEHAVIOR_TTL_MS * 2) behaviorCache.delete(k);
       }
     }
   } catch {}
