@@ -24,13 +24,13 @@ state:  重构已提交；用 git status / git rev-parse HEAD 获取实时状态
 - 账号：严格稳定轮询，每账号/模型独立 session 和冷却。
 - 推理：全局串行，直到整个上游 SSE 结束。
 - CLI 基线：Freebuff `0.0.149` / base3。
-- 当前适配器每次 HTTP 推理只代表一个 LLM step；不执行官方多 step 工具 loop。
+- 普通 HTTP 推理代表一个 LLM step；Responses `previous_response_id` 的 function_call 续接会复用 run 并累计 ledger，但不执行官方本地工具。
 
 ## 不要误改
 
 - 不要恢复 Cloudflare Worker 或 Vercel 特有逻辑。
 - 不要让 `/healthz` 主动请求上游。
-- 不要恢复伪造广告、设备信息、`wf-* client_id` 或 `end_turn` 注入。
+- 不要默认开启广告/usage 或伪造设备信息；只有用户显式设置 `FREEBUFF_CLIENT_BEHAVIOR=cli` 时才启用兼容请求。
 - 不要把 `rate_limited` 当成永久无效 token。
 - 不要优先选择 active session 破坏账号轮询。
 - 不要删除或 takeover 未被本进程持有的 session。
@@ -54,7 +54,7 @@ git diff --check
 
 - 内存状态不支持多 Node 实例共享。
 - `/v1/models` 只有在账号状态被真实业务请求观察后才能按 tier 收窄。
-- 没有完整 CLI 工具 runtime、登录、广告和磁盘 run-state。
+- 没有完整 CLI 工具 runtime、服务端浏览器登录和磁盘 run-state；ads/usage 兼容层默认关闭，Responses continuation 仅保存在内存。
 - 服务端私有风控不可从客户端代码确定。
 
 ## 工作区提醒

@@ -42,7 +42,7 @@ POST /v1/messages/count_tokens
 ## 主要重构
 
 - 按官方 base3 opening 和已验证核心提示构造 system message。
-- FINISH 使用真实 `totalSteps=1` 和 `steps` ledger，不再固定为0。
+- FINISH 使用真实 `totalSteps` 和 `steps` ledger；Responses 工具续接会复用同一 run，累计多个 LLM step。
 - 增加 `llm_step_number`，修正 `client_id` 和 Responses trace 延续。
 - 修复拆分工具调用、Responses tool history、尾部无换行 SSE 和无效 SSE 错误传播。
 - `/healthz` 只读本地缓存，不主动请求上游。
@@ -155,6 +155,8 @@ codex exec --profile freebuff "只回复：连接成功"
 | `PORT` | 否 | `8787` | 监听端口 |
 | `CODEBUFF_API` | 否 | `https://www.codebuff.com` | 上游地址 |
 | `FREEBUFF_DEBUG` | 否 | `false` | 输出脱敏路由日志 |
+| `FREEBUFF_CLIENT_BEHAVIOR` | 否 | `off` | 设为 `cli` 才启用 main 分支同款的节流 ads/usage 兼容请求；默认关闭 |
+| `FREEBUFF_FINGERPRINT_ID` | 否 | 自动派生 | `FREEBUFF_CLIENT_BEHAVIOR=cli` 时可提供你自己的稳定指纹 |
 | `SHUTDOWN_GRACE_MS` | 否 | `5000` | SIGINT/SIGTERM 等待活动 HTTP 请求的毫秒数；可设为 `0` |
 | `SHUTDOWN_CLEANUP_TIMEOUT_MS` | 否 | `5000` | 退出时等待 session DELETE 的毫秒数；可设为 `0` |
 
@@ -179,7 +181,8 @@ npm run audit:protocol
 本项目是协议适配器，不是完整 Freebuff CLI runtime：
 
 - 不在 VPS 执行官方15个本地工具。
-- 不实现完整多 step agent loop、浏览器登录、硬件指纹或广告闭环。
+- 支持 Responses `previous_response_id` 的客户端驱动多 step run 续接，但不在 VPS 执行官方15个本地工具；工具仍由 Codex/SDK 客户端执行。
+- 浏览器登录仍由 `freebuff_tools` 或官方 CLI 负责。服务端默认不发 ads/usage；如确需与 main 分支行为一致，可显式设置 `FREEBUFF_CLIENT_BEHAVIOR=cli`，并可用 `FREEBUFF_FINGERPRINT_ID` 指定稳定标识。
 - Codex 工具由 Codex 客户端执行，本服务负责正确传递 tool call/result。
 - 内存状态要求单 Node 实例运行。
 

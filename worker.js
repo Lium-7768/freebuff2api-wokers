@@ -94,7 +94,11 @@ let accountIdx = 0;
 const cooldowns = new Map();      // `${token}:${model || "*"}` -> 冷却到期 ms
 const sessCache = new Map();      // `${token}:${sessionModel}` -> { instanceId, model, remainingMs, expiresAt }（必须带 token，多账号防串号）
 const supersededTokens = new Set(); // 官方语义：本进程一旦被 supersede，不再重新抢占该账号 session
-const responseTraceCache = new Map(); // response id -> { traceSessionId, checkedAt }
+// Responses previous_response_id -> protocol continuation context.  The
+// official CLI keeps one agent run open while the model asks the client to
+// execute tools; retaining the run id here lets a Responses client continue
+// that same run without giving the adapter a local tool runtime.
+const responseTraceCache = new Map(); // response id -> { traceSessionId, runId, token, model, instanceId, totalSteps, steps, active, checkedAt }
 
 
 function parseAccounts(env) {
@@ -208,7 +212,7 @@ function cooldownUntil(token, sessionModel) {
   );
 }
 
-function pickToken(env, sessionModel, excluded = new Set()) {
+function pickToken(env, sessionModel, excluded = new Set(), preferredToken = null) {
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
 
@@ -219,6 +223,13 @@ function pickToken(env, sessionModel, excluded = new Set()) {
     return !(h && h.alive === false);
   });
   if (candidates.length === 0) return null;
+
+  // A Responses continuation must stay on the account that created the
+  // previous response; otherwise its run_id is not valid for the new token.
+  if (preferredToken) {
+    const preferred = candidates.find((acct) => acct.token === preferredToken);
+    if (preferred && cooldownUntil(preferred.token, sessionModel) <= Date.now()) return preferred;
+  }
 
   // 严格按配置顺序轮询。每个账号仍复用自己的 session 缓存，但活跃
   // session 不再抢占轮询顺序；这样 A/B/C 会稳定按请求交替使用。
@@ -616,8 +627,90 @@ class SessionOwnedElsewhereError extends Error {
   }
 }
 
-async function createSession(token, sessionModel, forceCreate = false, signal) {
-  // 只复用本进程仍然有效的同一模型 session；不伪造广告、设备或使用轨迹。
+// The upstream main branch contains an optional normal-client behavior layer
+// (fingerprint/ads/usage).  It is deliberately opt-in here: these calls are
+// not required by the session/chat wire contract, and enabling them changes
+// account-side behavior.  When enabled, the payloads follow the observed
+// client order and are throttled per account.
+const CLIENT_BEHAVIOR_TTL_MS = 30 * 60 * 1000;
+const clientBehaviorCache = new Map();
+
+function behaviorDue(key) {
+  const previous = clientBehaviorCache.get(key) || 0;
+  if (Date.now() - previous <= CLIENT_BEHAVIOR_TTL_MS) return false;
+  clientBehaviorCache.set(key, Date.now());
+  return true;
+}
+
+function stableFingerprint(token) {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  const input = `freebuff-fp-v2:${token}`;
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ code, 0x85ebca6b) >>> 0;
+  }
+  return `enhanced-${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}`;
+}
+
+async function runNormalClientBehavior(token, env, signal) {
+  if (String(env?.FREEBUFF_CLIENT_BEHAVIOR || "off").toLowerCase() !== "cli") return;
+  const fingerprintId = String(env.FREEBUFF_FINGERPRINT_ID || stableFingerprint(token));
+  const userAgent = "ai-sdk/openai-compatible/0.0.149/codebuff";
+
+  if (behaviorDue(`ads:${token}`)) {
+    try {
+      const ad = await enqueueUp(
+        "POST",
+        "/api/v1/ads",
+        token,
+        {
+          provider: "gravity",
+          sessionId: crypto.randomUUID(),
+          surface: "waiting_room",
+          device: { os: "unknown", timezone: "UTC", locale: "en-US" },
+          userAgent,
+        },
+        { "User-Agent": userAgent },
+        6000,
+        signal,
+      );
+      const impUrl = ad.data?.ads?.[0]?.impUrl;
+      if (ad.status >= 200 && ad.status < 300 && impUrl) {
+        await enqueueUp(
+          "POST",
+          "/api/v1/ads/impression",
+          token,
+          { impUrl, mode: "free" },
+          { "User-Agent": userAgent },
+          6000,
+          signal,
+        );
+      }
+    } catch {}
+  }
+
+  if (behaviorDue(`usage:${token}`)) {
+    try {
+      await enqueueUp(
+        "POST",
+        "/api/v1/usage",
+        token,
+        { fingerprintId },
+        {},
+        6000,
+        signal,
+      );
+    } catch {}
+  }
+}
+
+async function createSession(token, sessionModel, forceCreate = false, signal, env) {
+  // Optional compatibility behavior runs before session reuse, matching the
+  // ordering observed in the upstream main branch.
+  await runNormalClientBehavior(token, env, signal);
+  // 只复用本进程仍然有效的同一模型 session。
   // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
   const cacheKey = token + ":" + sessionModel;
   const cached = sessCache.get(cacheKey);
@@ -886,17 +979,20 @@ function newClientSessionId() {
   return Math.random().toString(36).substring(2, 15);
 }
 
-function traceSessionFor(previousResponseId) {
-  if (previousResponseId) {
-    const previous = responseTraceCache.get(previousResponseId);
-    if (previous?.traceSessionId) return previous.traceSessionId;
-  }
-  return crypto.randomUUID();
+function traceContextFor(previousResponseId) {
+  if (!previousResponseId) return null;
+  const previous = responseTraceCache.get(previousResponseId);
+  if (!previous || Date.now() - previous.checkedAt > 2 * 60 * 60 * 1000) return null;
+  return previous;
 }
 
-function rememberResponseTrace(responseId, traceSessionId) {
+function traceSessionFor(previousResponseId) {
+  return traceContextFor(previousResponseId)?.traceSessionId || crypto.randomUUID();
+}
+
+function rememberResponseTrace(responseId, traceSessionId, continuation = {}) {
   if (!responseId || !traceSessionId) return;
-  responseTraceCache.set(responseId, { traceSessionId, checkedAt: Date.now() });
+  responseTraceCache.set(responseId, { traceSessionId, ...continuation, checkedAt: Date.now() });
 }
 
 function buildUpstreamPayload(params, mc, sess, runId, clientSessionId, traceSessionId, llmStepNumber) {
@@ -1071,12 +1167,13 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
   let lastStatus = 502;
   const clientSessionId = newClientSessionId();
   const previousResponseId = mode === "responses" ? chatParams.__previous_response_id || null : null;
+  const previousTrace = mode === "responses" ? traceContextFor(previousResponseId) : null;
   const traceSessionId = traceSessionFor(previousResponseId);
   const attemptedTokens = new Set();
 
   try {
     for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-      const acct = pickToken(env, mc.session, attemptedTokens);
+      const acct = pickToken(env, mc.session, attemptedTokens, previousTrace?.active ? previousTrace.token : null);
       const token = acct ? acct.token : null;
       if (!token) break;
       attemptedTokens.add(token);
@@ -1103,11 +1200,24 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
       };
 
       try {
-        const sess = await createSession(token, mc.session, false, requestAbortSignal);
+        const sess = await createSession(token, mc.session, false, requestAbortSignal, env);
         if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
 
-        // CLI 0.0.149 uses one base3 root run: no context-pruner and no reviewer.
-        run = await startRunChain(token, mc.agent, requestAbortSignal);
+        // A Responses tool continuation reuses the same agent run and ledger
+        // on the account that produced previous_response_id.  New requests
+        // still start one base3 root run, preserving the adapter's no-runtime
+        // boundary while matching the CLI's multi-step FINISH contract.
+        if (previousTrace?.active && previousTrace.token === token && previousTrace.model === mc.session &&
+            previousTrace.instanceId === sess.instanceId && previousTrace.runId) {
+          run = {
+            runId: previousTrace.runId,
+            agentId: mc.agent,
+            totalSteps: Number.isInteger(previousTrace.totalSteps) ? previousTrace.totalSteps : 0,
+            steps: Array.isArray(previousTrace.steps) ? previousTrace.steps.map((item) => ({ ...item })) : [],
+          };
+        } else {
+          run = await startRunChain(token, mc.agent, requestAbortSignal);
+        }
         if (debug) console.log(`[acct ${acctTry + 1}] run=${run.runId} agent=${mc.agent}`);
         step = beginRunStep(run);
 
@@ -1176,18 +1286,40 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
         }
 
         recordAccountObservation(token, resp.status, null);
-        const finalizeStream = async (streamError) => {
+        const finalizeStream = async (streamError, streamInfo = {}) => {
           const aborted = requestAbortSignal?.aborted;
           const status = aborted ? "cancelled" : streamError ? "failed" : "completed";
           if (status === "completed") completeCurrentStep();
-          await finishCurrentRun(status, streamError ? String(streamError?.message || streamError) : undefined);
+          const hasContinuation = mode === "responses" && status === "completed" && streamInfo.hasToolCalls;
+          if (mode === "responses" && streamInfo.responseId) {
+            rememberResponseTrace(streamInfo.responseId, traceSessionId, {
+              token,
+              model: mc.session,
+              instanceId: sess.instanceId,
+              runId: run.runId,
+              totalSteps: run.totalSteps,
+              steps: run.steps,
+              active: hasContinuation,
+            });
+          }
+          if (!hasContinuation) {
+            await finishCurrentRun(status, streamError ? String(streamError?.message || streamError) : undefined);
+          }
           releaseChatSlot();
         };
 
         if (isStream) {
           const { readable, writable } = new TransformStream();
           slotTransferredToStream = true;
-          if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finalizeStream, previousResponseId, traceSessionId);
+          if (mode === "responses") pipeUpstreamToResponsesStream(
+            resp.body,
+            writable,
+            mc,
+            finalizeStream,
+            previousResponseId,
+            traceSessionId,
+            { token, model: mc.session, instanceId: sess.instanceId, runId: run.runId, totalSteps: run.totalSteps, steps: run.steps },
+          );
           else pipeUpstreamToClient(resp.body, writable, finalizeStream);
           return new Response(readable, {
             status: 200,
@@ -1198,9 +1330,22 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
         const result = mode === "responses"
           ? await responsesToNonStream(resp.body, mc, previousResponseId)
           : await streamToNonStream(resp.body, mc.upstream);
-        if (mode === "responses") rememberResponseTrace(result.id, traceSessionId);
         completeCurrentStep();
-        await finishCurrentRun("completed");
+        const hasContinuation = mode === "responses"
+          && Array.isArray(result.output)
+          && result.output.some((item) => item && item.type === "function_call");
+        if (mode === "responses") {
+          rememberResponseTrace(result.id, traceSessionId, {
+            token,
+            model: mc.session,
+            instanceId: sess.instanceId,
+            runId: run.runId,
+            totalSteps: run.totalSteps,
+            steps: run.steps,
+            active: hasContinuation,
+          });
+        }
+        if (!hasContinuation) await finishCurrentRun("completed");
         return jsonResponse(result, 200);
       } catch (error) {
         const aborted = requestAbortSignal?.aborted;
@@ -1564,6 +1709,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
     let streamError = null;
     let sawDone = false;
     let sawFinish = false;
+    let hasToolCalls = false;
     try {
       for await (const event of readUpstreamSse(upstreamBody)) {
         if (event.done) {
@@ -1573,6 +1719,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
         }
         const choice = event.obj?.choices?.[0];
         if (choice?.finish_reason) sawFinish = true;
+        if (Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length) hasToolCalls = true;
         await writer.write(encoder.encode("data: " + JSON.stringify(event.obj) + "\n\n"));
       }
       if (!sawDone && !sawFinish) throw new UpstreamProtocolError("upstream SSE ended before finish_reason or [DONE]");
@@ -1585,7 +1732,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
       } catch {}
     }
     finally {
-      try { if (onComplete) await onComplete(streamError); } catch {}
+      try { if (onComplete) await onComplete(streamError, { hasToolCalls }); } catch {}
       try { await writer.close(); } catch {}
     }
   })();
@@ -1691,12 +1838,20 @@ function chatUsageToResponsesUsage(usage) {
 }
 
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
-async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete, previousResponseId = null, traceSessionId = null) {
+async function pipeUpstreamToResponsesStream(
+  upstreamBody,
+  writable,
+  mc,
+  onComplete,
+  previousResponseId = null,
+  traceSessionId = null,
+  continuation = {},
+) {
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const respId = "resp_" + Math.random().toString(36).slice(2, 10);
   const createdAt = Math.floor(Date.now() / 1000);
-  rememberResponseTrace(respId, traceSessionId);
+  rememberResponseTrace(respId, traceSessionId, { ...continuation, active: false });
   let model = "", usage = null, sawDone = false, finishReason = null;
   const send = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
 
@@ -1830,7 +1985,9 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       } catch {}
     }
     finally {
-      try { if (onComplete) await onComplete(streamError); } catch {}
+      try {
+        if (onComplete) await onComplete(streamError, { responseId: respId, hasToolCalls: toolItems.size > 0 });
+      } catch {}
       try { await writer.close(); } catch {}
     }
   })();

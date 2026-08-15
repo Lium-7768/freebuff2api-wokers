@@ -10,10 +10,10 @@
 | `client_id` 使用自定义格式 | `Math.random().toString(36).substring(2, 15)` | CLI 二进制内嵌代码 |
 | 每个 HTTP 请求都创建新 trace | Responses 的 `previous_response_id` 复用 trace | 官方 `previousRun.traceSessionId` 行为 |
 | metadata 缺少 step | 增加 `llm_step_number="1"` | CLI 二进制 + agent runtime 源码 |
-| FINISH 固定 `totalSteps=0` | 单次上游 LLM 调用记录 `totalSteps=1` 和一个 completed step | 真实 run-state + FINISH schema |
+| FINISH 固定 `totalSteps=0` | 记录真实 step ledger；Responses 工具续接时复用 run 并累计 `totalSteps` | 真实 run-state + FINISH schema |
 | FINISH 没有 `steps` | 发送符合官方 schema 的 step ledger | `sdk/src/impl/database.ts` |
 | session timeout 10 秒 | session/run timeout 20 秒 | 官方 CLI 行为 |
-| 每 30 分钟伪造 `/usage` 请求 | 删除自动 usage touch | Freebuff 禁用常驻 usage monitor |
+| 默认每 30 分钟自动触碰 `/usage` | 改为 `FREEBUFF_CLIENT_BEHAVIOR=cli` 显式启用，并按账号节流 | main 分支行为 + VPS 默认最小副作用 |
 | 复用或删除未知 active session | 未知 session 不复用、不删除、不 takeover | 官方 owner 生命周期 |
 | 进程退出不清理 | SIGINT/SIGTERM 释放本进程 session | 官方退出 DELETE 行为 |
 | 非流式 Chat 丢失拆分工具调用 | 聚合 tool id/name/arguments 并返回 `message.tool_calls` | 官方 SSE 工具分片行为 |
@@ -41,11 +41,11 @@
 这些差异是明确保留的架构边界：
 
 - 官方15个工具的本地执行器。
-- 多 step 本地 agent loop、工具执行和 continuation。
-- 完整 run-state/message history 磁盘持久化。
+- 官方本地工具执行器；Responses 的客户端驱动 continuation 已实现，VPS 不执行工具本身。
+- 完整 run-state/message history 磁盘持久化（当前只在内存保存 Responses continuation 映射）。
 - CLI owner 文件、PID 检测和30秒 session polling。
 - 浏览器登录、硬件指纹和 credentials 管理。
-- 广告请求、展示、impression/click 闭环。
+- 默认关闭的广告请求、展示、impression/click 闭环（`FREEBUFF_CLIENT_BEHAVIOR=cli` 时按 main 分支顺序启用 ads/usage）。
 
 Codex 工具仍由 Codex 客户端执行；适配器只负责正确传递 tool call 和 tool result。
 

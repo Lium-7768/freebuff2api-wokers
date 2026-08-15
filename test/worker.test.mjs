@@ -68,6 +68,12 @@ function mockUpstream({ onChat, onSessionGet, onSessionPost, onSessionDelete, ca
     };
     calls.push(call);
 
+    if (parsed.pathname === '/api/v1/ads' && call.method === 'POST') {
+      return Response.json({ ads: [{ impUrl: 'https://ads.local/impression/1' }] });
+    }
+    if (parsed.pathname === '/api/v1/ads/impression' && call.method === 'POST') {
+      return Response.json({ ok: true });
+    }
     if (parsed.pathname === '/api/v1/usage') return Response.json({ ok: true });
     if (parsed.pathname === '/api/v1/freebuff/session' && call.method === 'GET') {
       return Response.json(onSessionGet ? onSessionGet(call) : { status: 'ended' }, { status: 200 });
@@ -195,6 +201,27 @@ test('normal chat uses one base3 root and records an accurate completed finish',
   const chat = calls.find((call) => call.path === '/api/v1/chat/completions');
   assert.equal(chat.body.codebuff_metadata.llm_step_number, '1');
   assert.match(chat.body.messages[0].content, /^You are Buffy, the coding agent behind Codebuff\./);
+});
+
+test('main-branch client behavior is opt-in and uses the configured fingerprint', async () => {
+  const calls = [];
+  mockUpstream({ calls });
+  const response = await worker.fetch(
+    request('/v1/chat/completions', chatBody()),
+    {
+      ...env(),
+      FREEBUFF_CLIENT_BEHAVIOR: 'cli',
+      FREEBUFF_FINGERPRINT_ID: 'fp-test-stable',
+    },
+  );
+  assert.equal(response.status, 200);
+  const behaviorCalls = calls.filter((call) => ['/api/v1/ads', '/api/v1/ads/impression', '/api/v1/usage'].includes(call.path));
+  assert.deepEqual(behaviorCalls.map((call) => call.path), [
+    '/api/v1/ads',
+    '/api/v1/ads/impression',
+    '/api/v1/usage',
+  ]);
+  assert.deepEqual(behaviorCalls[2].body, { fingerprintId: 'fp-test-stable' });
 });
 
 test('an owned session below the reuse window is deleted and recreated', async () => {
@@ -628,6 +655,56 @@ test('Responses previous_response_id preserves trace_session_id but creates a ne
   assert.notEqual(payloads[0].codebuff_metadata.client_id, payloads[1].codebuff_metadata.client_id);
 });
 
+test('Responses tool continuation reuses the run and accumulates the step ledger', async () => {
+  const calls = [];
+  let chatNumber = 0;
+  mockUpstream({
+    calls,
+    onChat: () => {
+      chatNumber += 1;
+      if (chatNumber === 1) {
+        return new Response([
+          `data: ${JSON.stringify({ id: 'chat-continuation-1', choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_continue', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }] }, finish_reason: 'tool_calls' }] })}\n\n`,
+          'data: [DONE]\n\n',
+        ].join(''), { headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      return sse('continuation complete');
+    },
+  });
+
+  const firstResponse = await worker.fetch(request('/v1/responses', {
+    model: 'deepseek/deepseek-v4-flash',
+    input: 'use a tool',
+    tools: [{ type: 'function', name: 'read_file', parameters: { type: 'object' } }],
+    stream: false,
+  }), env());
+  const first = await firstResponse.json();
+  assert.equal(firstResponse.status, 200);
+  assert.equal(first.output[0].type, 'function_call');
+
+  const secondResponse = await worker.fetch(request('/v1/responses', {
+    model: 'deepseek/deepseek-v4-flash',
+    previous_response_id: first.id,
+    input: [
+      { type: 'function_call', call_id: 'call_continue', name: 'read_file', arguments: '{"path":"README.md"}' },
+      { type: 'function_call_output', call_id: 'call_continue', output: 'contents' },
+    ],
+    stream: false,
+  }), env());
+  assert.equal(secondResponse.status, 200);
+
+  const starts = calls.filter((call) => call.path === '/api/v1/agent-runs' && call.body?.action === 'START');
+  const finishes = calls.filter((call) => call.path === '/api/v1/agent-runs' && call.body?.action === 'FINISH');
+  const payloads = calls.filter((call) => call.path === '/api/v1/chat/completions').map((call) => call.body);
+  assert.equal(starts.length, 1);
+  assert.equal(finishes.length, 1);
+  assert.equal(finishes[0].body.totalSteps, 2);
+  assert.equal(finishes[0].body.steps.length, 2);
+  assert.equal(payloads[0].codebuff_metadata.run_id, payloads[1].codebuff_metadata.run_id);
+  assert.equal(payloads[0].codebuff_metadata.llm_step_number, '1');
+  assert.equal(payloads[1].codebuff_metadata.llm_step_number, '2');
+});
+
 test('streaming Responses emits complete function-call argument events', async () => {
   const calls = [];
   mockUpstream({
@@ -647,6 +724,7 @@ test('streaming Responses emits complete function-call argument events', async (
   assert.match(text, /"type":"response\.function_call_arguments\.done"/);
   assert.match(text, /"arguments":"\{\\"path\\":\\"worker\.js\\"\}"/);
   assert.match(text, /"type":"response\.completed"/);
+  assert.equal(calls.filter((call) => call.path === '/api/v1/agent-runs' && call.body?.action === 'FINISH').length, 0);
 });
 
 test('final SSE event without a trailing newline is still consumed', async () => {

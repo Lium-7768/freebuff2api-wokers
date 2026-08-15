@@ -46,6 +46,7 @@ flowchart LR
 - 每账号、每模型 session 缓存
 - 当前进程被 supersede 的账号
 - Responses `previous_response_id` 到 `trace_session_id` 的映射
+- Responses continuation 到 run/step ledger 的映射
 - 已观察到的账号健康和 access tier
 
 因此应在 VPS 上运行**单实例**。多进程或多副本之间没有共享状态。
@@ -82,5 +83,5 @@ Freebuff 免费通道不适合并发推理。当前实现：
 
 1. 停止接收新请求。
 2. 等待 HTTP 服务关闭。
-3. DELETE 当前进程明确持有的 session。
+3. 结束/取消当前请求中的 run，再 DELETE 当前进程明确持有的 session。
 4. 不处理其他客户端的 session。

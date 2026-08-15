@@ -46,6 +46,8 @@ const env = {
   FREEBUFF_TOKEN: tokenLines.join(','),
   FREEBUFF_API_KEY: apiKey,
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
+  FREEBUFF_CLIENT_BEHAVIOR: process.env.FREEBUFF_CLIENT_BEHAVIOR || 'off',
+  FREEBUFF_FINGERPRINT_ID: process.env.FREEBUFF_FINGERPRINT_ID || '',
   CODEBUFF_API: process.env.CODEBUFF_API || '',
 };
 const shutdownSignalController = new AbortController();
