@@ -8,7 +8,7 @@
   python3 extract_freebuff.py session         # 测试开 session（POST）
   python3 extract_freebuff.py chat [消息]     # 发一条消息测试模型 API
   python3 extract_freebuff.py quota           # 查用量 /api/v1/usage
-  python3 extract_freebuff.py export          # 汇总全部账号 token 一行一个（复制进 CF Workers 变量）
+  python3 extract_freebuff.py export          # 汇总全部账号 token，一行一个供 VPS 配置使用
 
 流程（与官方 CLI 一致）：
   1. 生成设备指纹 fingerprintId
@@ -39,6 +39,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 BASE_URL = "https://www.codebuff.com"
@@ -312,7 +313,7 @@ def cmd_login(args):
                     f"账号：`{email}`\n"
                     f"id：`{user.get('id')}`\n"
                     f"credits：`{user.get('credits')}`\n\n"
-                    "把下面这行填进 Cloudflare Worker 机密变量 `FREEBUFF_TOKEN`"
+                    "把下面这行保存到 VPS 的 `credentials/*.json` 或 `FREEBUFF_TOKEN`"
                     "（多账号则换行追加）：\n"
                     f"`{auth_token}`"
                 )
@@ -322,7 +323,7 @@ def cmd_login(args):
                 print("🔑 authToken 已通过 Telegram 私密发送（未写入日志）。")
             else:
                 mask_value(auth_token)
-                print("\n🔑 把下面这行填进 Cloudflare Worker 的机密变量 FREEBUFF_TOKEN：")
+                print("\n🔑 把下面这行保存到 VPS 的 credentials/*.json 或 FREEBUFF_TOKEN：")
                 print("    " + auth_token)
             return user
         elif status == 401:
@@ -352,7 +353,7 @@ def cmd_show(_args):
         print(f"      {at}")
         print(f"      {detail}")
     print("-" * 60)
-    print("\n📋 汇总（一行一个，复制进 CF Worker 变量 FREEBUFF_TOKEN）:")
+    print("\n📋 汇总（一行一个，供 VPS 的 FREEBUFF_TOKEN 使用）:")
     for _key, at, _email in pairs:
         print(f"   {at}")
     return 0
@@ -381,18 +382,16 @@ CANONICAL_BUFFY = "You are Buffy, the strategic coding assistant."
 
 # 模型 → 上游 agentId（对齐 worker.js 的 MODELS 表；free 模式校验 agent+model 组合）
 MODEL_AGENTS = {
-    "deepseek/deepseek-v4-flash": "base2-free-deepseek-flash",
-    "deepseek/deepseek-v4-pro": "base2-free-deepseek",
-    "moonshotai/kimi-k2.6": "base2-free-kimi",
-    "minimax/minimax-m2.7": "base2-free",
-    "minimax/minimax-m3": "base2-free-minimax-m3",
-    "mimo/mimo-v2.5": "base2-free-mimo",
-    "mimo/mimo-v2.5-pro": "base2-free-mimo-pro",
+    "deepseek/deepseek-v4-flash": "base3-free-deepseek-flash",
+    "deepseek/deepseek-v4-pro": "base3-free-deepseek",
+    "openai/gpt-5.6-luna": "base3-free-luna",
+    "minimax/minimax-m3": "base3-free-minimax-m3",
+    "mimo/mimo-v2.5": "base3-free-mimo",
 }
 
 
 def agent_for_model(model):
-    return MODEL_AGENTS.get(model, "base2-free-deepseek-flash")
+    return MODEL_AGENTS.get(model, "base3-free-deepseek-flash")
 
 
 def cmd_chat(args):
@@ -404,7 +403,7 @@ def cmd_chat(args):
     # 1) 先确保有 active session（官方门控：无 session → 428 waiting_room_required）
     model = args.model or MODEL_DEFAULT
     # 官方 SDK UA（free 模式识别依赖，浏览器 UA 会被拒）
-    sdk_ua = "ai-sdk/openai-compatible/0.0.141/codebuff"
+    sdk_ua = "ai-sdk/openai-compatible/0.0.149/codebuff"
     headers = {"Authorization": f"Bearer {tok}", "User-Agent": sdk_ua}
     status, sess, _ = _http("POST", "/api/v1/freebuff/session",
                             headers={**headers, "x-freebuff-model": model})
@@ -435,7 +434,7 @@ def cmd_chat(args):
             if not args.force:
                 sys.exit(1)
 
-    # 2) 调 chat/completions：canonical Buffy 开头 + SDK UA + acting-user-id + data_collection deny
+    # 2) 调 chat/completions：canonical Buffy 开头 + SDK UA + data_collection deny
     chat_headers = {
         "Authorization": f"Bearer {tok}",
         "Content-Type": "application/json",
@@ -443,16 +442,7 @@ def cmd_chat(args):
     }
     if instance_id:
         chat_headers["x-freebuff-instance-id"] = instance_id
-    # 有凭证 id 就带 acting-user-id（官方 SDK 会带）
-    uid = None
-    if CRED_FILE.exists():
-        try:
-            uid = json.loads(CRED_FILE.read_text()).get("default", {}).get("id")
-        except Exception:
-            pass
-    if uid:
-        chat_headers["x-freebuff-acting-user-id"] = uid
-
+    trace_session_id = str(uuid.uuid4())
     body = {
         "model": model,
         "messages": [
@@ -465,6 +455,7 @@ def cmd_chat(args):
         "codebuff_metadata": {
             "run_id": run_id or f"run-{secrets.token_hex(6)}",
             "client_id": f"cli-{secrets.token_hex(6)}",
+            "trace_session_id": trace_session_id,
             "cost_mode": "free",
             **({"freebuff_instance_id": instance_id} if instance_id else {}),
         },
@@ -480,12 +471,19 @@ def cmd_chat(args):
             print(f"🧠 reasoning: {msg['reasoning_content'][:200]}")
         print(f"   usage: {data.get('usage')}")
         # 清理 run
-        _http("POST", "/api/v1/agent-runs", {"action": "FINISH", "runId": run_id}, headers)
+        _http("POST", "/api/v1/agent-runs", {
+            "action": "FINISH", "runId": run_id, "status": "completed",
+            "totalSteps": 0, "directCredits": 0, "totalCredits": 0,
+        }, headers)
     else:
         print(json.dumps(data, indent=2, ensure_ascii=False)[:1500] if data else "(空响应)")
         # 清理 run
         if run_id:
-            _http("POST", "/api/v1/agent-runs", {"action": "CANCEL", "runId": run_id}, headers)
+            _http("POST", "/api/v1/agent-runs", {
+                "action": "FINISH", "runId": run_id, "status": "failed",
+                "totalSteps": 0, "directCredits": 0, "totalCredits": 0,
+                "errorMessage": str(data)[:5000],
+            }, headers)
 
 
 def cmd_quota(_args):
@@ -503,7 +501,8 @@ def _all_tokens():
     """返回 [(key, token, email)]：优先读取 credentials.json 里的全部账号；未配置则用环境变量。"""
     tok = os.environ.get("FREEBUFF_TOKEN")
     if tok:
-        return [("env", tok, "环境变量")]
+        tokens = [value.strip() for value in tok.replace(",", "\n").splitlines() if value.strip()]
+        return [(f"env-{index}", value, "环境变量") for index, value in enumerate(tokens, 1)]
     if CRED_FILE.exists():
         try:
             cred = json.loads(CRED_FILE.read_text())
@@ -618,13 +617,13 @@ def _check_one(tok):
 
 
 def cmd_export(_args):
-    """汇总全部账号的 FREEBUFF_TOKEN，一行一个，方便复制进 CF Workers 变量。"""
+    """汇总全部账号的 FREEBUFF_TOKEN，一行一个，供 VPS 环境变量使用。"""
     pairs = _all_tokens()
     if not pairs:
         print("❌ 未找到 authToken（先运行 login 或设置 FREEBUFF_TOKEN）")
         sys.exit(1)
-    print("# freebuff2api CF Workers 变量 FREEBUFF_TOKEN（一行一个账号）")
-    print("# 共 %d 个账号，复制下面的行到 Cloudflare → 变量 → FREEBUFF_TOKEN" % len(pairs))
+    print("# freebuff2api VPS 变量 FREEBUFF_TOKEN（一行一个账号）")
+    print("# 共 %d 个账号，可写入 .env 或 credentials/*.json" % len(pairs))
     print("# 注意：本输出含敏感 token，请勿泄露/提交到 git")
     print("=" * 60)
     for _key, tok, _email in pairs:
@@ -658,7 +657,7 @@ def main():
 
     sub.add_parser("quota", help="查用量")
 
-    sub.add_parser("export", help="汇总全部账号 token，一行一个，复制进 CF Workers 变量")
+    sub.add_parser("export", help="汇总全部账号 token，一行一个，供 VPS 配置使用")
 
     args = p.parse_args()
     {

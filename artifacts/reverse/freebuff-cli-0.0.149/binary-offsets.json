@@ -1,0 +1,48 @@
+{
+  "sample_sha256": "fecf6ec876666cc0f60578d0ebcf4bb320e090335fbadc0bec0aebd0780e5a85",
+  "offsets": [
+    { "offset": 62748202, "value": "CODEBUFF_CLI_VERSION:\"0.0.149\"" },
+    { "offset": 69288334, "value": "base3-free-deepseek-flash" },
+    { "offset": 69297076, "value": "You are Buffy, the coding agent behind Codebuff." },
+    { "offset": 69329977, "value": "You are Buffy, the strategic coding assistant." },
+    { "offset": 69122648, "value": "/api/v1/freebuff/session" },
+    { "offset": 67008170, "value": "/api/v1/agent-runs" },
+    { "offset": 67008308, "value": "action:\"START\"" },
+    { "offset": 67009291, "value": "action:\"FINISH\"" },
+    { "offset": 67042902, "value": "codebuff_metadata" },
+    { "offset": 66788256, "value": "llm_step_number" },
+    { "offset": 70145396, "value": "freebuff_instance_id" },
+    { "offset": 69119563, "value": "session_superseded" },
+    { "offset": 69119720, "value": "waiting_room_queued" },
+    { "offset": 70174958, "value": "/api/v1/ads/impression" },
+    { "offset": 67164454, "value": "/api/auth/cli/code" },
+    { "offset": 67164556, "value": "/api/auth/cli/status" },
+    { "offset": 69121526, "value": "freebuff-instance-owner.json" }
+  ],
+  "confirmed_finish_fields": [
+    "runId",
+    "status",
+    "totalSteps",
+    "directCredits",
+    "totalCredits",
+    "errorMessage",
+    "steps"
+  ],
+  "confirmed_base3_tools": [
+    "read_files",
+    "str_replace",
+    "write_file",
+    "run_terminal_command",
+    "code_search",
+    "glob",
+    "list_directory",
+    "write_todos",
+    "web_search",
+    "read_url",
+    "ask_user",
+    "suggest_followups",
+    "gravity_index",
+    "render_ui",
+    "skill"
+  ]
+}

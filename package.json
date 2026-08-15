@@ -1,11 +1,14 @@
 {
   "name": "freebuff2api-container",
-  "version": "1.7.0",
+  "version": "1.9.0",
   "type": "module",
   "private": true,
-  "description": "freebuff2api-wokers v1.6.5 worker.js running in Node container",
+  "description": "Freebuff OpenAI-compatible adapter for a self-hosted Node/VPS runtime",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test --test-concurrency=1 test/worker.test.mjs",
+    "test:e2e": "node test/e2e-local.mjs",
+    "audit:protocol": "node scripts/audit/protocol-audit.mjs && node scripts/audit/responses-history-audit.mjs"
   },
   "engines": {
     "node": ">=20"

@@ -18,6 +18,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run protocol regression tests
+        run: npm test
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3.0.0
 

@@ -5,367 +5,35 @@ function codebuffApi() {
   return configuredCodebuffApi;
 }
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.9";
-const CONTEXT_PRUNER_AGENT = "context-pruner";
+const VERSION = "1.9.0";
 
-// 动态模型注册表：从官方 freebuff 镜像拉取模型清单
-// 真源: https://github.com/CodebuffAI/freebuff (freebuff-private 的 public 镜像)
-// 与 Freebuff Desktop 0.0.51 orchestrator.js 的 FREEBUFF_ROOT_AGENT_ID_BY_MODEL 同源
-// （镜像常量 = 桌面版同源源码，安装包只是编译产物）
-// 需要 3 个源（常量分散定义）：
-//   1. free-agents.ts       → FREEBUFF_ROOT_AGENT_ID_BY_MODEL（模型→agent 映射）
-//   2. freebuff-models.ts   → 大部分模型 ID 常量 + 池定义（PREMIUM/GLM）
-//   3. freebuff-model-ids.ts→ deepseek/m3 等 ID 常量（被 models.ts re-export）
-// 每源都有 raw 主源 + jsDelivr 备用
-const DYNAMIC_MODELS_SOURCES = [
-  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/free-agents.ts",
-  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/free-agents.ts",
-];
-const DYNAMIC_MODELS_MODEL_IDS_SOURCES = [
-  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/freebuff-models.ts",
-  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/freebuff-models.ts",
-];
-const DYNAMIC_MODELS_STABLE_IDS_SOURCES = [
-  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/freebuff-model-ids.ts",
-  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/freebuff-model-ids.ts",
-];
-// Releases 兜底源：GitHub Actions 每天生成的解析好的 JSON（无需解析，直接可用）
-// 当官方 3 个源全部失败/解析失败时使用。比 raw.githubusercontent 更稳（GitHub CDN）。
-// 已实测（2026-08-11）：releases/latest/download 地址 HTTP 200，内容正确。
-const DYNAMIC_MODELS_RELEASE_SOURCES = [
-  "https://github.com/pingmike2/freebuff2api-wokers/releases/latest/download/freebuff-models.json",
-];
-// 刷新间隔：与 Quorinex 对齐，6 小时。失败时回退到硬编码 MODELS。
-const DYNAMIC_MODELS_REFRESH_MS = 6 * 60 * 60 * 1000;
-const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
-
-// 运行时动态模型缓存（内存，无 KV）
-let dynamicModelsCache = {
-  fetchedAt: 0,
-  models: null, // 动态模型表（含分类）
-  pool: null, // { premium: Set, standard: Set, glm: Set }
-};
-
-// 解析 freebuff-models.ts 的模型 ID 常量
-// 形如:
-//   export const FREEBUFF_MIMO_V25_MODEL_ID = mimoModels.mimoV25
-//   export const FREEBUFF_MINIMAX_M3_MODEL_ID = 'minimax/minimax-m3'
-// 兼容: 'string' | 标识符.成员（取成员名查 knownDefaults）| 标识符
-function parseModelIdConstants(source) {
-  const table = {};
-  const knownDefaults = {
-    mimoV25: "mimo/mimo-v2.5",
-  };
-  // 匹配 export const NAME = 'value' 或 export const NAME = expr
-  const re = /export\s+const\s+([A-Z0-9_]+)\s*=\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_.]+))/g;
-  let m;
-  while ((m = re.exec(source)) !== null) {
-    const name = m[1];
-    const lit = m[2] ?? m[3] ?? "";
-    const expr = m[4] ?? "";
-    if (lit) table[name] = lit;
-    else if (expr) {
-      // 标识符.成员 → 取成员名（mimoModels.mimoV25 → mimoV25）
-      const member = expr.includes(".") ? expr.split(".").pop() : expr;
-      if (knownDefaults[member]) table[name] = knownDefaults[member];
-      else if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.:/-]+$/.test(expr)) table[name] = expr;
-    }
-  }
-  return table;
-}
-
-// 解析 free-agents.ts 中按用途分开的 agent 映射。
-// 不把 base2 root、base3 root、reviewer 混为一张表：它们属于不同运行路径。
-function parseAgentMappings(source, modelIdConstants) {
-  const blockNames = {
-    root: "FREEBUFF_ROOT_AGENT_ID_BY_MODEL",
-    base3: "FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL",
-    reviewer: "FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL",
-  };
-  const result = { root: {}, base3: {}, reviewer: {} };
-  const lineRe = /\[\s*([A-Z0-9_]+)\s*\]\s*:\s*'([^']+)'/g;
-  for (const [kind, blockName] of Object.entries(blockNames)) {
-    const blockRe = new RegExp(`${blockName}[^=]*=\\s*\\{([^}]*)\\}`);
-    const blockMatch = blockRe.exec(source);
-    if (!blockMatch) continue;
-    let m;
-    lineRe.lastIndex = 0;
-    while ((m = lineRe.exec(blockMatch[1])) !== null) {
-      const modelId = modelIdConstants[m[1]];
-      if (modelId) result[kind][modelId] = m[2];
-    }
-  }
-  return result;
-}
-
-// 兼容旧调用方：默认返回普通 base2 root 映射。
-function parseAgentMapping(source, modelIdConstants) {
-  return parseAgentMappings(source, modelIdConstants).root;
-}
-
-// 解析 freebuff-models.ts 的池定义（PREMIUM / GLM；STANDARD 由 non-premium 推导）
-// FREEBUFF_WEB_PREMIUM_MODEL_IDS 含 spread（...FREEBUFF_PREMIUM_MODEL_IDS）
-function parseModelPools(source, modelIdConstants) {
-  const premium = new Set();
-  const glm = new Set();
-  const used = new Set();
-  // 展开 spread: ...FOO → FOO 里的条目（常量名 → 值）
-  const constValues = new Map();
-  const constListRe = /export\s+const\s+([A-Z0-9_]+)\s*=\s*\[([^\]]*)\]\s*as\s*const/g;
-  let cm;
-  while ((cm = constListRe.exec(source)) !== null) {
-    const name = cm[1];
-    const items = [];
-    const itemRe = /\.\.\.([A-Z0-9_]+)|'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
-    let im;
-    while ((im = itemRe.exec(cm[2])) !== null) {
-      const spread = im[1];
-      const lit = im[2] ?? im[3];
-      const expr = im[4];
-      if (spread) items.push(["spread", spread]);
-      else if (lit) items.push(["lit", lit]);
-      else if (expr && modelIdConstants[expr]) items.push(["lit", modelIdConstants[expr]]);
-    }
-    constValues.set(name, items);
-  }
-  // 解析池
-  const poolRe = /export\s+const\s+(FREEBUFF_WEB_PREMIUM_MODEL_IDS|FREEBUFF_GLM_V52_MODEL_IDS|FREEBUFF_PREMIUM_MODEL_IDS)\s*=\s*\[([^\]]*)\]/g;
-  let pm;
-  while ((pm = poolRe.exec(source)) !== null) {
-    const poolName = pm[1];
-    const items = [];
-    const itemRe = /\.\.\.([A-Z0-9_]+)|'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
-    let im;
-    while ((im = itemRe.exec(pm[2])) !== null) {
-      const spread = im[1];
-      const lit = im[2] ?? im[3];
-      const expr = im[4];
-      if (spread) {
-        // 递归展开 spread 常量
-        const expand = (n) => {
-          const entries = constValues.get(n) || [];
-          for (const [kind, val] of entries) {
-            if (kind === "spread") expand(val);
-            else items.push(val);
-          }
-        };
-        expand(spread);
-      } else if (lit) items.push(lit);
-      else if (expr && modelIdConstants[expr]) items.push(modelIdConstants[expr]);
-    }
-    if (poolName === "FREEBUFF_GLM_V52_MODEL_IDS") {
-      for (const id of items) glm.add(id);
-    } else {
-      for (const id of items) premium.add(id);
-    }
-  }
-  // FREEBUFF_PREMIUM_MODEL_IDS 与 FREEBUFF_WEB_PREMIUM_MODEL_IDS 都算 premium
-  return { premium: [...premium], glm: [...glm] };
-}
-
-// 动态模型表：分别记录普通 root、base3 root、reviewer。
-function buildDynamicModelTable(agentMappings) {
-  // 兼容旧调用：传入单张 root mapping 时仍可正常构建。
-  const mappings = agentMappings && agentMappings.root
-    ? agentMappings
-    : { root: agentMappings || {}, base3: {}, reviewer: {} };
-  return Object.entries(mappings.root).map(([modelId, rootAgent]) => ({
-    id: modelId,
-    session: modelId,
-    // 旧字段保留为普通 root，普通 chat 永远使用它。
-    agent: rootAgent,
-    root_agent: rootAgent,
-    base3_agent: mappings.base3[modelId] || null,
-    reviewer_agent: mappings.reviewer[modelId] || null,
-    upstream: modelId,
-  }));
-}
-
-// 合并硬编码与动态表：硬编码优先（不覆盖），动态新增追加
-function mergeModelTables(hardcoded, dynamic) {
-  const seen = new Set(hardcoded.map((m) => m.id));
-  const merged = [...hardcoded];
-  for (const m of dynamic) {
-    if (!seen.has(m.id)) {
-      merged.push(m);
-      seen.add(m.id);
-    }
-  }
-  return merged;
-}
-
-// 拉取并刷新动态模型缓存（失败静默回退）
-async function fetchSourceList(urls) {
-  for (const url of urls) {
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
-      const resp = await fetch(url, { signal: ctrl.signal });
-      clearTimeout(timer);
-      if (resp.ok) {
-        const text = await resp.text();
-        // 阈值放宽：freebuff-model-ids.ts 只有 ~491B（3 个常量），
-        // 500 阈值会误杀。只过滤真正的空文件（<100B）。
-        if (text && text.length > 100) return text;
-      }
-    } catch {}
-  }
-  return null;
-}
-
-async function refreshDynamicModelsIfStale() {
-  const now = Date.now();
-  if (dynamicModelsCache.models && now - dynamicModelsCache.fetchedAt < DYNAMIC_MODELS_REFRESH_MS) {
-    return dynamicModelsCache;
-  }
-  // 并行拉 3 个源（每源主 raw + 备 jsDelivr）
-  const [agentsSrc, modelsSrc, stableIdsSrc] = await Promise.all([
-    fetchSourceList(DYNAMIC_MODELS_SOURCES),
-    fetchSourceList(DYNAMIC_MODELS_MODEL_IDS_SOURCES),
-    fetchSourceList(DYNAMIC_MODELS_STABLE_IDS_SOURCES),
-  ]);
-  if (!agentsSrc || !modelsSrc) {
-    // 官方源拉取失败：尝试 Releases JSON 兜底
-    const release = await tryReleaseFallback();
-    if (release) {
-      dynamicModelsCache = release;
-      return dynamicModelsCache;
-    }
-    // Releases 也失败：保留旧缓存（若有），否则维持现状
-    return dynamicModelsCache;
-  }
-  try {
-    // 合并常量表：models.ts 优先（完整），stableIds.ts 补充 deepseek/m3
-    const modelIdConstants = { ...parseModelIdConstants(stableIdsSrc || ""), ...parseModelIdConstants(modelsSrc) };
-    const agentMappings = parseAgentMappings(agentsSrc, modelIdConstants);
-    if (Object.keys(agentMappings.root).length === 0) {
-      // 解析失败：尝试 Releases 兜底
-      const release = await tryReleaseFallback();
-      if (release) {
-        dynamicModelsCache = release;
-        return dynamicModelsCache;
-      }
-      return dynamicModelsCache;
-    }
-    const pools = parseModelPools(modelsSrc, modelIdConstants);
-    dynamicModelsCache = {
-      fetchedAt: Date.now(),
-      models: buildDynamicModelTable(agentMappings),
-      pool: {
-        premium: new Set(pools.premium),
-        standard: null,
-        glm: new Set(pools.glm),
-      },
-    };
-  } catch {
-    // 解析崩溃：尝试 Releases 兜底
-    const release = await tryReleaseFallback();
-    if (release) {
-      dynamicModelsCache = release;
-      return dynamicModelsCache;
-    }
-    // 保留旧缓存
-  }
-  return dynamicModelsCache;
-}
-
-// Releases JSON 兜底：直接拉预生成的 models.json，零解析成本
-async function tryReleaseFallback() {
-  for (const url of DYNAMIC_MODELS_RELEASE_SOURCES) {
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
-      const resp = await fetch(url, { signal: ctrl.signal });
-      clearTimeout(timer);
-      if (resp.ok) {
-        const json = await resp.json();
-        if (json && Array.isArray(json.models) && json.models.length > 0) {
-          return {
-            fetchedAt: Date.now(),
-            models: json.models,
-            pool: {
-              premium: new Set(json.pools?.premium ?? []),
-              standard: null,
-              glm: new Set(json.pools?.glm ?? []),
-            },
-          };
-        }
-      }
-    } catch {}
-  }
-  return null;
-}
-
-// 动态 STANDARD = 动态表里不在 premium/glm 池的模型
-function dynamicStandardModels() {
-  const cache = dynamicModelsCache;
-  if (!cache || !cache.models || !cache.pool) return new Set();
-  const premium = cache.pool.premium;
-  const glm = cache.pool.glm;
-  return new Set(cache.models.map((m) => m.id).filter((id) => !premium.has(id) && !glm.has(id)));
-}
-
-// 模型池分类查询：动态池优先，硬编码兜底
-// 返回 "premium" | "standard" | "glm" | null
-function modelPoolCategory(modelId) {
-  const dyn = dynamicModelsCache;
-  if (dyn && dyn.pool) {
-    if (dyn.pool.premium.has(modelId)) return "premium";
-    if (dyn.pool.glm.has(modelId)) return "glm";
-    if (dynamicStandardModels().has(modelId)) return "standard";
-  }
-  // 硬编码兜底
-  if (PREMIUM_QUOTA_MODELS.has(modelId)) return "premium";
-  if (STANDARD_MODELS.has(modelId)) return "standard";
-  return null;
-}
-
-
-// 模型 → session 用模型名 / 上游 agentId / 上游 chat 模型名
-// 只保留 1 个硬编码兜底（极端情况下至少有一个可用）：
-//   - mimo/mimo-v2.5   STANDARD 模型
-// 其余模型全部由动态拉取提供（官方源 → GitHub Releases JSON → 这个兜底）
+// Freebuff CLI 0.0.149 uses the base3 harness. Keep this catalog limited to the
+// ordinary CLI picker; entitlement- or capacity-gated models are not advertised.
 const MODELS = [
-  { id: "mimo/mimo-v2.5", session: "mimo/mimo-v2.5", agent: "base2-free-mimo", upstream: "mimo/mimo-v2.5" },
+  { id: "deepseek/deepseek-v4-pro", session: "deepseek/deepseek-v4-pro", agent: "base3-free-deepseek", upstream: "deepseek/deepseek-v4-pro" },
+  { id: "deepseek/deepseek-v4-flash", session: "deepseek/deepseek-v4-flash", agent: "base3-free-deepseek-flash", upstream: "deepseek/deepseek-v4-flash" },
+  { id: "openai/gpt-5.6-luna", session: "openai/gpt-5.6-luna", agent: "base3-free-luna", upstream: "openai/gpt-5.6-luna" },
+  { id: "minimax/minimax-m3", session: "minimax/minimax-m3", agent: "base3-free-minimax-m3", upstream: "minimax/minimax-m3" },
+  { id: "mimo/mimo-v2.5", session: "mimo/mimo-v2.5", agent: "base3-free-mimo", upstream: "mimo/mimo-v2.5" },
 ];
 
-// ---------------------------------------------------------------------------
-// 额度池说明（逆向自官方源码 freebuff-models.ts，2026-08-10 实证）
-//
-// 官方三种额度池（都是 session 次数，非 token 数）：
-//   1. PREMIUM 池：共享 6 次/天（FREEBUFF_PREMIUM_SESSION_LIMIT=6）
-//      m3 / v4-pro / luna / laguna-s-2.1 / muse-spark / greg-2 等
-//      （FREEBUFF_WEB_PREMIUM_MODEL_IDS）
-//   2. STANDARD 池：浏览器/Web 端 6 次/天
-//      （FREEBUFF_WEB_STANDARD_SESSION_LIMIT=6；= 所有非 premium 模型，
-//      即 Flash / MiMo 2.5 等。FREEBUFF_WEB_STANDARD_MODEL_IDS）
-//      ⚠️ 注释原文："The CLI keeps these models UNLIMITED; browser surfaces
-//      cap fresh sessions to deter automated project/session churn."
-//      → CLI 协议 Flash 无限，但 CLI 已被官方封堵（free_mode_cli_required）；
-//        桌面版/Web 协议下 Flash 同样受 6 次/天限制
-//   3. GLM 5.2 池：独立，referral 解锁（不计入以上）
-//
-// 桌面版并发桶（FREEBUFF_DESKTOP_SESSION_LIMITS，仅限并发非额度）：
-//   premium:  1  ← Premium 模型每用户同时 1 个活跃 session
-//   unlimited: 3 ← Flash/MiMo 每用户最多 3 个并发 tab
-//   limited 访问层（无 Premium 的号）：所有模型都占 1 个 slot
-//   （occupiesFreebuffDesktopSlot / getFreebuffDesktopSessionBucket）
-//
-// 对 1.7.0 的意义：单号串行时每天上限 = Premium 6 + Flash 6（07:00 UTC
-// 太平洋日重置）。并发到多号会同时烧各号额度，无法靠并发突破 6 次/天。
-// 额度池只用于选号，绝不改变调用方请求的模型。
-// ---------------------------------------------------------------------------
+// Quota classification is used only for interpreting an already-observed
+// session snapshot. It never adds models to the public catalog.
 const PREMIUM_QUOTA_MODELS = new Set([
   "deepseek/deepseek-v4-pro",
   "openai/gpt-5.6-luna",
   "minimax/minimax-m3",
-  "meta/muse-spark-1.2-contributor",
 ]);
 const STANDARD_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
   "mimo/mimo-v2.5",
 ]);
+
+function modelPoolCategory(modelId) {
+  if (PREMIUM_QUOTA_MODELS.has(modelId)) return "premium";
+  if (STANDARD_MODELS.has(modelId)) return "standard";
+  return null;
+}
 
 export default {
   async fetch(request, env) {
@@ -373,15 +41,17 @@ export default {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
-    // healthz 不鉴权：健康检查/监控探针不应依赖 API key
+    // Public liveness endpoint: expose aggregates only, never token/uid prefixes
+    // or per-account state labels.
     if (request.method === "GET" && url.pathname === "/healthz") {
-      // 健康检查只读 Worker 最近一次真实请求形成的本地快照。
-      // 不因为公开探针访问就向上游 fan-out GET /session 和 /me；这类请求
-      // 会产生额外行为，也可能干扰同一账号正在进行的会话。
+      const summary = summarizeAccountHealth(parseAccounts(env), acctHealth);
       return jsonResponse({
-        status: "ok",
+        status: summary.status,
         version: VERSION,
-        ...summarizeAccountHealth(parseAccounts(env), acctHealth),
+        accounts: summary.accounts,
+        alive_accounts: summary.alive_accounts,
+        unknown_accounts: summary.unknown_accounts,
+        unhealthy_accounts: summary.unhealthy_accounts,
         health_source: "worker_cache",
         time: new Date().toISOString(),
       }, 200);
@@ -398,7 +68,7 @@ export default {
     cleanCache();
 
     if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-      return await handleModels();
+      return await handleModels(env);
     }
     if (request.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
       return handleChat(request, env);
@@ -421,13 +91,16 @@ export default {
 // ---------------------------------------------------------------------------
 
 let accountIdx = 0;
-const cooldowns = new Map();      // token -> 冷却到期 ms
+const cooldowns = new Map();      // `${token}:${model || "*"}` -> 冷却到期 ms
 const sessCache = new Map();      // `${token}:${sessionModel}` -> { instanceId, model, remainingMs, expiresAt }（必须带 token，多账号防串号）
+const supersededTokens = new Set(); // 官方语义：本进程一旦被 supersede，不再重新抢占该账号 session
+const responseTraceCache = new Map(); // response id -> { traceSessionId, checkedAt }
 
 
 function parseAccounts(env) {
   // 支持一行一个（换行）或逗号分隔；每项可为纯 token 或 "token:uid"（冒号配对 user_id）
   // 例："t1\nt2:u2\nt3,u4:u4" → [{token:t1,uid:null},{token:t2,uid:u2},...]
+  const seen = new Set();
   return (env.FREEBUFF_TOKEN || "").split(/[\n,]/)
     .map((s) => s.trim())
     .filter((s) => s.length > 8)
@@ -436,7 +109,11 @@ function parseAccounts(env) {
       if (idx > 0) return { token: s.slice(0, idx).trim(), uid: s.slice(idx + 1).trim() || null };
       return { token: s, uid: null };
     })
-    .filter((a) => a.token.length > 8);
+    .filter((a) => {
+      if (a.token.length <= 8 || seen.has(a.token)) return false;
+      seen.add(a.token);
+      return true;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -468,13 +145,17 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
   if (!state) return;
 
   const previous = acctHealth.get(token) || {};
+  const invalidStates = new Set(["token_invalid", "banned", "country_blocked", "blocked"]);
   acctHealth.set(token, {
     ...previous,
     ...extra,
-    alive: state === "ok",
+    // 限流、模型锁定和 IP 容量限制都说明 token 仍有效，只是暂时不可用于
+    // 当前请求。只有确定的凭证/账号级拒绝才将账号移出轮询池。
+    alive: !invalidStates.has(state),
     state,
     uid: extra.uid || previous.uid || null,
     quota: extra.quota || previous.quota || null,
+    accessTier: extra.accessTier || data?.accessTier || previous.accessTier || null,
     retryAfterMs: typeof extra.retryAfterMs === "number" ? extra.retryAfterMs : previous.retryAfterMs || null,
     checkedAt: Date.now(),
   });
@@ -497,11 +178,12 @@ function summarizeAccountHealth(pool, health) {
   const alive_accounts = account_details.filter((p) => p.alive === true).length;
   const unknown_accounts = account_details.filter((p) => p.alive === null).length;
   const unhealthy_accounts = account_details.filter((p) => p.alive === false).length;
+  const hasDegradedState = account_details.some((detail) => detail.state !== "ok");
   const status = pool.length === 0
     ? "critical"
-    : alive_accounts === 0 && (unhealthy_accounts > 0 || unknown_accounts > 0)
+    : alive_accounts === 0 && unhealthy_accounts > 0 && unknown_accounts === 0
       ? "critical"
-      : unhealthy_accounts > 0 || unknown_accounts > 0
+      : unhealthy_accounts > 0 || unknown_accounts > 0 || hasDegradedState
         ? "degraded"
         : "ok";
   return {
@@ -509,52 +191,45 @@ function summarizeAccountHealth(pool, health) {
     accounts: pool.length,
     alive_accounts,
     unknown_accounts,
+    unhealthy_accounts,
     account_states,
     account_details,
   };
 }
 
-function pickToken(env, sessionModel) {
+function cooldownKey(token, sessionModel) {
+  return `${token}:${sessionModel || "*"}`;
+}
+
+function cooldownUntil(token, sessionModel) {
+  return Math.max(
+    cooldowns.get(cooldownKey(token, "*")) || 0,
+    cooldowns.get(cooldownKey(token, sessionModel)) || 0,
+  );
+}
+
+function pickToken(env, sessionModel, excluded = new Set()) {
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
 
-  // v1.6.0：跳过已探测为失效的号（alive=false）；未探测/探测失败的不跳过（避免误杀）
-  const alivePool = pool.filter((acct) => {
+  // 只跳过有确定证据表明不可用的账号；未知账号仍参与轮询。
+  const candidates = pool.filter((acct) => {
+    if (excluded.has(acct.token) || supersededTokens.has(acct.token)) return false;
     const h = acctHealth.get(acct.token);
     return !(h && h.alive === false);
   });
-  const usePool = alivePool.length > 0 ? alivePool : pool; // 全失效时回退全池，让请求继续（由 429 冷却接管）
+  if (candidates.length === 0) return null;
 
-  // v1.8.5.1：账号选择恢复为稳定轮询。
-  // rateLimitsByModel 仅作为观测数据，不参与轮询顺序；真实 session/chat
-  // 返回明确限流后，再通过 cooldown 跳过该账号。这样不会因为旧快照
-  // 抢占轮询，也不会把账号顺序重排成“剩余额度最多优先”。
-  const finalPool = usePool;
-
-  // 优先复用已有活跃 session 缓存的号：一个 session 约 1 小时有效，创建 session 才扣
-  // 免费额度（如 v4-pro 每天 6 次）。纯轮询会让每个请求都切号、各建一个 session，
-  // 浪费创建额度。只要当前模型的 session 缓存还活跃就钉在同一个号上，用满再换。
-  if (sessionModel) {
-    for (const acct of finalPool) {
-      const t = acct.token;
-      if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
-      const cached = sessCache.get(t + ":" + sessionModel);
-      if (isUsableSession(cached)) {
-        return acct;
-      }
-    }
+  // 严格按配置顺序轮询。每个账号仍复用自己的 session 缓存，但活跃
+  // session 不再抢占轮询顺序；这样 A/B/C 会稳定按请求交替使用。
+  for (let k = 0; k < pool.length; k++) {
+    const acct = pool[accountIdx % pool.length];
+    accountIdx = (accountIdx + 1) % pool.length;
+    if (!candidates.some((candidate) => candidate.token === acct.token)) continue;
+    if (cooldownUntil(acct.token, sessionModel) > Date.now()) continue;
+    return acct;
   }
-
-  // 没有活跃缓存才轮询（跳过冷却中的号）
-  for (let k = 0; k < finalPool.length; k++) {
-    const acct = finalPool[accountIdx % finalPool.length];
-    accountIdx = (accountIdx + 1) % finalPool.length;
-    const t = acct.token;
-    if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
-  }
-  const oldest = [...cooldowns.entries()].sort((a, b) => a[1] - b[1])[0];
-  if (oldest) cooldowns.delete(oldest[0]);
-  return finalPool[0];
+  return null;
 }
 
 function normalizeSession(data, requestedModel, now = Date.now()) {
@@ -588,32 +263,45 @@ function logAccountRoute(enabled, pool, token, model, attempt, reason) {
   } catch {}
 }
 
-function cooldown(token, ms) {
-  if (ms > 0) cooldowns.set(token, Date.now() + ms);
+function cooldown(token, sessionModel, ms) {
+  if (ms > 0) cooldowns.set(cooldownKey(token, sessionModel), Date.now() + ms);
+}
+
+function poolRetryAfterMs(pool, sessionModel) {
+  const now = Date.now();
+  const waits = pool
+    .filter((acct) => !supersededTokens.has(acct.token) && acctHealth.get(acct.token)?.alive !== false)
+    .map((acct) => cooldownUntil(acct.token, sessionModel) - now)
+    .filter((ms) => ms > 0);
+  return waits.length ? Math.min(...waits) : null;
 }
 
 // Official Freebuff session-gate recovery requires matching both the HTTP
 // status and the relayed error code. Do not treat session_limit_reached or
 // waiting_room_queued as stale sessions: those states must not delete a live
 // session or burn another session slot.
-const SESSION_GATE_RECOVERY = {
-  waiting_room_required: 428,
-  session_expired: 410,
-  session_superseded: 409,
-  session_model_mismatch: 409,
+const SESSION_GATE_CODES = {
+  waiting_room_required: { status: 428, endsSession: true },
+  session_expired: { status: 410, endsSession: true },
+  session_superseded: { status: 409, endsSession: true },
+  session_model_mismatch: { status: 409, endsSession: true },
+  session_limit_reached: { status: 409, endsSession: false },
+  waiting_room_queued: { status: 429, endsSession: false },
 };
 
-function hasExactErrorCode(value, expected) {
-  if (value === expected) return true;
-  if (!value || typeof value !== "object") return false;
-  return Object.values(value).some((entry) => hasExactErrorCode(entry, expected));
-}
-
-function isStaleSessionGate(status, body) {
+function getSessionGateCode(status, body) {
   let parsed = null;
   try { parsed = JSON.parse(body); } catch {}
-  return Object.entries(SESSION_GATE_RECOVERY).some(([code, expectedStatus]) =>
-    status === expectedStatus && hasExactErrorCode(parsed, code));
+  const code = parsed && typeof parsed === "object" ? parsed.error : null;
+  if (typeof code !== "string" || !Object.hasOwn(SESSION_GATE_CODES, code)) return null;
+  return SESSION_GATE_CODES[code].status === status ? code : null;
+}
+
+function shouldRotateAccount(status) {
+  // 只在账号/容量/临时上游故障时换号。请求结构错误在所有账号上都会
+  // 重现，不应消耗整个账号池。
+  return status === 401 || status === 402 || status === 403 || status === 408 || status === 409 ||
+    status === 429 || status >= 500;
 }
 
 // 仅供流式无首数据时确认 Premium 额度是否耗尽；不参与账号轮询排序。
@@ -623,10 +311,7 @@ function remainingQuota(token, sessionModel) {
   if (!h || !h.quota) return null;
   let entry = h.quota[sessionModel];
   if (!entry && modelPoolCategory(sessionModel) === "premium") {
-    const premiumPool = (dynamicModelsCache.pool && dynamicModelsCache.pool.premium)
-      ? dynamicModelsCache.pool.premium
-      : PREMIUM_QUOTA_MODELS;
-    for (const model of premiumPool) {
+    for (const model of PREMIUM_QUOTA_MODELS) {
       if (h.quota[model]) {
         entry = h.quota[model];
         break;
@@ -648,10 +333,7 @@ function isQuotaExhausted(info, sessionModel) {
   if (!info.quota) return false;
   let entry = info.quota[sessionModel];
   if (!entry && modelPoolCategory(sessionModel) === "premium") {
-    const premiumPool = (dynamicModelsCache.pool && dynamicModelsCache.pool.premium)
-      ? dynamicModelsCache.pool.premium
-      : PREMIUM_QUOTA_MODELS;
-    for (const model of premiumPool) {
+    for (const model of PREMIUM_QUOTA_MODELS) {
       if (info.quota[model]) { entry = info.quota[model]; break; }
     }
   }
@@ -664,12 +346,17 @@ function parseCooldown(text, status) {
   const jm = (text || "").match(/"retryAfterMs"\s*:\s*(\d+)/);
   if (jm) {
     const ms = parseInt(jm[1], 10);
-    if (ms > 0) return Math.min(ms, 6 * 3600 * 1000);
+    if (ms > 0) return ms;
+  }
+  const resetMatch = (text || "").match(/"resetAt"\s*:\s*"([^"]+)"/);
+  if (resetMatch) {
+    const resetAt = Date.parse(resetMatch[1]);
+    if (Number.isFinite(resetAt) && resetAt > Date.now()) return resetAt - Date.now();
   }
   const m = (text || "").match(/try again in (?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i);
   if (m) {
     const ms = (parseInt(m[1]||0,10)*3600 + parseInt(m[2]||0,10)*60 + parseInt(m[3]||0,10)) * 1000;
-    if (ms > 0) return Math.min(ms, 6*3600*1000);
+    if (ms > 0) return ms;
   }
   return status === 429 ? 5*60*1000 : 60*1000;
 }
@@ -705,6 +392,23 @@ async function deleteUpstreamSession(token, instanceId) {
   } catch {}
 }
 
+// VPS 进程退出时只释放本进程缓存中明确持有的 session。不会扫描或删除
+// 其他客户端的活跃 session。
+export async function closeOwnedSessions() {
+  const owned = [];
+  const seen = new Set();
+  for (const [key, session] of sessCache) {
+    if (!session?.instanceId || seen.has(session.instanceId)) continue;
+    const splitAt = key.lastIndexOf(":");
+    if (splitAt <= 0) continue;
+    owned.push({ token: key.slice(0, splitAt), instanceId: session.instanceId });
+    seen.add(session.instanceId);
+  }
+  for (const session of owned) {
+    await deleteUpstreamSession(session.token, session.instanceId);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 上游请求（串行队列，免费通道并发超过 1 就出问题）
 // ---------------------------------------------------------------------------
@@ -719,14 +423,60 @@ function enqueue(fn) {
   return run;
 }
 
+// Hold one slot for the complete model response, not merely until fetch()
+// returns its headers. This prevents two inference streams from overlapping.
+let chatTail = Promise.resolve();
+
+async function acquireChatSlot(signal) {
+  const previous = chatTail.catch(() => {});
+  let releaseGate;
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+  chatTail = previous.then(() => gate);
+
+  if (signal?.aborted) {
+    releaseGate();
+    throw signal.reason || new DOMException("Aborted", "AbortError");
+  }
+
+  let abortHandler;
+  try {
+    await (signal
+      ? Promise.race([
+          previous,
+          new Promise((_, reject) => {
+            abortHandler = () => reject(signal.reason || new DOMException("Aborted", "AbortError"));
+            signal.addEventListener("abort", abortHandler, { once: true });
+          }),
+        ])
+      : previous);
+  } catch (error) {
+    releaseGate();
+    throw error;
+  } finally {
+    if (abortHandler) signal.removeEventListener("abort", abortHandler);
+  }
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseGate();
+  };
+}
+
+function requestSignal(timeoutMs, parentSignal) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout;
+}
+
 const UPSTREAM_TIMEOUT_MS = 20000; // 上游单请求超时，避免客户端干等
 const NONSTREAM_TIMEOUT_MS = 45000; // 非流式要聚合完整上游流（含推理），给更充裕时间
-const SESSION_TIMEOUT_MS = 10000;  // session/run 等短交互更快失败
+const SESSION_TIMEOUT_MS = 20000;  // Freebuff CLI 0.0.149 的 session 请求超时为 20 秒
 // 这不是流式请求的失败时间，只是首个数据迟迟未到时启动一次额度探测的观察窗口。
 // 额度仍在时不 abort、不切号，继续等待上游。
 const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
 
-async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS, signal) {
   const headers = {};
   // 桌面版协议：不手动设置 User-Agent（fetch 默认），只带必要的业务头
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -737,7 +487,7 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: requestSignal(timeoutMs, signal),
   });
   const text = await resp.text();
   let data = null;
@@ -745,8 +495,8 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
   return { status: resp.status, data, text };
 }
 
-function enqueueUp(method, path, token, body, extraHeaders, timeoutMs) {
-  return enqueue(() => up(method, path, token, body, extraHeaders, timeoutMs));
+function enqueueUp(method, path, token, body, extraHeaders, timeoutMs, signal) {
+  return enqueue(() => up(method, path, token, body, extraHeaders, timeoutMs, signal));
 }
 
 // 流式无首数据时的额度检查：只读本地缓存，绝不打上游。
@@ -764,8 +514,13 @@ async function freshQuotaProbe(token, sessionModel) {
 
 // 流式 chat 不设置总时长 abort。只有在首个数据迟迟未到时，
 // 才强制刷新账号额度；额度未知或仍有额度时，原请求继续等待。
-async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
+async function fetchStreamWithQuotaGuard(url, init, token, sessionModel, parentSignal) {
   const controller = new AbortController();
+  const abortFromParent = () => {
+    try { controller.abort(parentSignal.reason); } catch { controller.abort(); }
+  };
+  if (parentSignal?.aborted) abortFromParent();
+  else parentSignal?.addEventListener("abort", abortFromParent, { once: true });
   const request = fetch(url, { ...init, signal: controller.signal });
   let probeTimer = null;
   const armProbe = () => new Promise((_, reject) => {
@@ -811,15 +566,21 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
           } catch (error) {
             streamController.error(error);
           } finally {
+            parentSignal?.removeEventListener("abort", abortFromParent);
             try { reader.releaseLock(); } catch {}
           }
         })();
       },
-      cancel(reason) { return reader.cancel(reason); },
+      cancel(reason) {
+        parentSignal?.removeEventListener("abort", abortFromParent);
+        try { controller.abort(reason); } catch { controller.abort(); }
+        return reader.cancel(reason);
+      },
     });
     return new Response(body, { status: response.status, headers: response.headers });
   } catch (error) {
     clearProbe();
+    parentSignal?.removeEventListener("abort", abortFromParent);
     try { controller.abort(error); } catch { controller.abort(); }
     throw error;
   }
@@ -829,89 +590,14 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
 // session 生命周期
 // ---------------------------------------------------------------------------
 
-// Official CLI side-channel requests. These are deliberately implemented as
-// configurable/observational behavior: usage uses the documented `cli-usage` marker,
-// while ads are fetched with the real prompt messages and VPS runtime details.
-// We never emit an impression because this adapter does not render an ad to a
-// human; claiming one would create false billing/telemetry.
-const CLIENT_BEHAVIOR_TTL_MS = 30 * 60 * 1000;
-const behaviorCache = new Map();
-
-function behaviorDue(key) {
-  const previous = behaviorCache.get(key) || 0;
-  if (Date.now() - previous <= CLIENT_BEHAVIOR_TTL_MS) return false;
-  behaviorCache.set(key, Date.now());
-  return true;
-}
-
-function runtimeAdDevice() {
-  const platform = typeof process !== "undefined" ? process.platform : "linux";
-  const os = platform === "darwin" ? "macos" : platform === "win32" ? "windows" : "linux";
-  const resolved = Intl.DateTimeFormat().resolvedOptions();
-  return {
-    os,
-    timezone: resolved.timeZone || "UTC",
-    locale: resolved.locale || "en-US",
-  };
-}
-
-function runtimeAdUserAgent() {
-  // Same browser-like UA family used by the official ad hook. This describes
-  // the actual server runtime as Linux rather than pretending to be macOS.
-  return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-}
-
-function runtimeCliAdUserAgent(env) {
-  const version = String(env.FREEBUFF_CLI_VERSION || "0.0.149").trim();
-  return `Freebuff-CLI/${version}`;
-}
-
-function adMessagesFromParams(params) {
-  return normalizeMessages(params?.messages).map((message) => ({
-    role: message.role,
-    content: typeof message.content === "string"
-      ? message.content
-      : JSON.stringify(message.content ?? ""),
-  }));
-}
-
-async function runOfficialClientBehavior(token, env, params, clientSessionId) {
-  // The official usage query uses this literal marker, not a token-derived
-  // hardware fingerprint. It is useful for diagnostics and quota UI only.
-  if (behaviorDue(`usage:${token}`)) {
-    try {
-      await enqueueUp("POST", "/api/v1/usage", token,
-        { fingerprintId: "cli-usage" }, undefined, 6000);
-    } catch (error) {
-      if (env.FREEBUFF_DEBUG === "true") {
-        console.log(`[behavior] usage touch failed: ${String(error?.message || error).slice(0, 120)}`);
-      }
-    }
-  }
-
-  // Fetching ads is opt-in because a headless adapter cannot truthfully record
-  // that the user saw an impression. Set FREEBUFF_ADS_MODE=fetch to request
-  // the same ad payload as the CLI; no impression is reported automatically.
-  if (String(env.FREEBUFF_ADS_MODE || "fetch").toLowerCase() !== "fetch") return;
-  if (!behaviorDue(`ads:${token}`)) return;
-
-  try {
-    await enqueueUp("POST", "/api/v1/ads", token, {
-      provider: "gravity",
-      messages: adMessagesFromParams(params),
-      sessionId: clientSessionId,
-      device: runtimeAdDevice(),
-      surface: "cli_chat",
-      userAgent: runtimeAdUserAgent(),
-    }, { "User-Agent": runtimeCliAdUserAgent(env) }, 6000);
-  } catch (error) {
-    if (env.FREEBUFF_DEBUG === "true") {
-      console.log(`[behavior] ad fetch failed: ${String(error?.message || error).slice(0, 120)}`);
-    }
+class SessionOwnedElsewhereError extends Error {
+  constructor(model) {
+    super(`account already has an active Freebuff session${model ? ` for ${model}` : ""}`);
+    this.name = "SessionOwnedElsewhereError";
   }
 }
 
-async function createSession(token, sessionModel, forceCreate = false) {
+async function createSession(token, sessionModel, forceCreate = false, signal) {
   // 只复用本进程仍然有效的同一模型 session；不伪造广告、设备或使用轨迹。
   // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
   if (!forceCreate) {
@@ -925,19 +611,27 @@ async function createSession(token, sessionModel, forceCreate = false) {
   //    导致 chat 一直 428；强制 POST 拿全新实例）。GET 使用 CLI 的普通请求形态。
   if (!forceCreate) {
     const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
-      undefined, SESSION_TIMEOUT_MS);
+      undefined, SESSION_TIMEOUT_MS, signal);
     recordAccountObservation(token, cur.status, cur.data, {
       quota: cur.data?.rateLimitsByModel || null,
       uid: cur.data?.uid || null,
       retryAfterMs: cur.data?.retryAfterMs,
+      accessTier: cur.data?.accessTier || null,
     });
     if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
-      const cm = cur.data.model;
-      if (!cm || cm === sessionModel) {
+      const ownedByThisProcess = [...sessCache.values()]
+        .some((session) => session.instanceId === cur.data.instanceId);
+      if (!ownedByThisProcess) {
+        // 缓存未命中且 instanceId 不属于本进程，说明 session 由官方 CLI
+        // 或另一 VPS 进程持有。不复用、不删除、不 takeover。
+        throw new SessionOwnedElsewhereError(cur.data.model || sessionModel);
+      }
+      if (!cur.data.model || cur.data.model === sessionModel) {
         const s = normalizeSession(cur.data, sessionModel);
         sessCache.set(token + ":" + sessionModel, s);
         return s;
       }
+      // 同一进程主动切换模型时可以安全释放自己持有的旧 session。
       await deleteUpstreamSession(token, cur.data.instanceId);
     }
   }
@@ -945,11 +639,12 @@ async function createSession(token, sessionModel, forceCreate = false) {
 
   // 2) create（可能 queue）。官方 CLI 的 POST 只发送模型头；实例 ID 由服务端生成。
   const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
-    { "x-freebuff-model": sessionModel }, SESSION_TIMEOUT_MS);
+    { "x-freebuff-model": sessionModel }, SESSION_TIMEOUT_MS, signal);
   recordAccountObservation(token, r.status, r.data, {
     quota: r.data?.rateLimitsByModel || null,
     uid: r.data?.uid || null,
     retryAfterMs: r.data?.retryAfterMs,
+    accessTier: r.data?.accessTier || null,
   });
   if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
     const s = normalizeSession(r.data, sessionModel);
@@ -960,11 +655,12 @@ async function createSession(token, sessionModel, forceCreate = false) {
     const inst = r.data.instanceId;
     for (let i = 0; i < 8; i++) {
       await sleep(1500);
-      const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
+      const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS, signal);
       recordAccountObservation(token, q.status, q.data, {
         quota: q.data?.rateLimitsByModel || null,
         uid: q.data?.uid || null,
         retryAfterMs: q.data?.retryAfterMs,
+        accessTier: q.data?.accessTier || null,
       });
       if (q.status === 200 && q.data?.status === "active") {
         const s = normalizeSession({ ...q.data, instanceId: q.data.instanceId || inst }, sessionModel);
@@ -982,40 +678,55 @@ async function createSession(token, sessionModel, forceCreate = false) {
 // agent-runs 生命周期
 // ---------------------------------------------------------------------------
 
-function utcNow() {
-  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
-}
-
-async function startRun(token, agentId, ancestors = []) {
+async function startRun(token, agentId, ancestors = [], signal) {
   const r = await enqueueUp("POST", "/api/v1/agent-runs", token,
-    { action: "START", agentId, ancestorRunIds: ancestors }, undefined, SESSION_TIMEOUT_MS);
+    { action: "START", agentId, ancestorRunIds: ancestors }, undefined, SESSION_TIMEOUT_MS, signal);
   if (r.status !== 200 || !r.data?.runId) throw new Error("start_run failed: " + r.status + " " + (r.text || "").slice(0, 200));
   return r.data.runId;
 }
 
-async function recordStep(token, runId, stepNumber, startTime, children = [], messageId = null) {
-  await enqueueUp("POST", `/api/v1/agent-runs/${runId}/steps`, token,
-    { stepNumber, credits: 0, childRunIds: children, messageId, status: "completed", startTime }, undefined, SESSION_TIMEOUT_MS);
-}
-
-async function finishRun(token, runId, totalSteps) {
+async function finishRun(token, chain, status, errorMessage) {
   await enqueueUp("POST", "/api/v1/agent-runs", token,
-    { action: "FINISH", runId, status: "completed", totalSteps, directCredits: 0, totalCredits: 0 }, undefined, SESSION_TIMEOUT_MS);
+    {
+      action: "FINISH",
+      runId: chain.runId,
+      status,
+      totalSteps: chain.totalSteps,
+      directCredits: 0,
+      totalCredits: 0,
+      ...(errorMessage ? { errorMessage: String(errorMessage).slice(0, 5000) } : {}),
+      steps: chain.steps,
+    }, undefined, SESSION_TIMEOUT_MS);
 }
 
-async function startRunChain(token, agentId) {
-  const startedAt = utcNow();
-  const runId = await startRun(token, agentId);
-  const childRunId = await startRun(token, CONTEXT_PRUNER_AGENT, [runId]);
-  return { runId, agentId, startedAt, childRunId, cached: false };
+async function startRunChain(token, agentId, signal) {
+  const runId = await startRun(token, agentId, [], signal);
+  return { runId, agentId, totalSteps: 0, steps: [] };
 }
 
-async function finishRunChain(token, chain, totalSteps = 1) {
+function beginRunStep(chain) {
+  chain.totalSteps += 1;
+  return {
+    stepNumber: chain.totalSteps,
+    startTime: new Date().toISOString(),
+  };
+}
+
+function completeRunStep(chain, step, messageId = null) {
+  chain.steps.push({
+    id: crypto.randomUUID(),
+    stepNumber: step.stepNumber,
+    credits: 0,
+    childRunIds: [],
+    messageId,
+    status: "completed",
+    startTime: step.startTime,
+  });
+}
+
+async function finishRunChain(token, chain, status, errorMessage) {
   if (!chain) return;
-  // Finish the child first, then its ancestor. Best-effort cleanup must never
-  // replace a successful model response with an analytics failure.
-  if (chain.childRunId) await finishRun(token, chain.childRunId, totalSteps).catch(() => {});
-  if (chain.runId) await finishRun(token, chain.runId, totalSteps).catch(() => {});
+  if (chain.runId) await finishRun(token, chain, status, errorMessage).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,34 +740,57 @@ const UPSTREAM_KEYS = [
   "temperature", "tool_choice", "tools", "top_logprobs", "top_p", "top_k", "user",
 ];
 
-// 官方 free-mode marker 要求系统提示必须以 "You are Buffy, the strategic coding assistant."
-// 字节级开头（服务端 hasFreebuffRootSystemPromptOpening 检查，旧 `[System Override...]`
-// 前缀绕过已被官方修补并返回 403 free_mode_cli_required）。
-const BUFFY = "You are Buffy, the strategic coding assistant.";
+const BASE3_OPENING = "You are Buffy, the coding agent behind Codebuff.";
+
+// 来自 Freebuff CLI 0.0.149 对应 base3 源码的已确认核心提示。CLI 还会在
+// 运行时追加 knowledge files、系统信息和初始 git 状态；适配器没有这些真实
+// 上下文，因此不伪造，只保留可由公开源码逐字验证的部分。
+function base3SystemPrompt() {
+  return `${BASE3_OPENING} You help users with software engineering tasks: fixing bugs, adding functionality, refactoring, and explaining code.
+
+Current date: ${new Date().toISOString().slice(0, 10)}.
+
+- Match the project's existing conventions. Verify a library is already used in the project before employing it.
+- Prefer editing existing files over creating new ones. Make the fewest changes that address the request.
+- Verify non-trivial changes by running the project's typecheck and relevant tests.
+- Use write_todos to plan and track multi-step tasks.
+- Your responses are displayed in a terminal. Keep them short and concise.
+- Don't run destructive or hard-to-undo commands (git push, resets, deploys) unless the user asks for them.`;
+}
+
+function withBase3Prefix(content, prompt) {
+  if (typeof content === "string") {
+    return content.trimStart().startsWith(BASE3_OPENING) ? content : `${prompt}\n\n${content}`;
+  }
+  if (Array.isArray(content)) {
+    const parts = content.map((part) => part && typeof part === "object" ? { ...part } : part);
+    const firstText = parts.find((part) => part && part.type === "text" && typeof part.text === "string");
+    if (firstText?.text.trimStart().startsWith(BASE3_OPENING)) return parts;
+    parts.unshift({ type: "text", text: prompt });
+    return parts;
+  }
+  return prompt;
+}
 
 function normalizeMessages(messages) {
-  if (!Array.isArray(messages)) return [];
+  const prompt = base3SystemPrompt();
+  if (!Array.isArray(messages)) return [{ role: "system", content: prompt, cache_control: { type: "ephemeral" } }];
   const out = [];
-  let hasSystem = false;
+  let prefixedSystem = false;
   for (const m of messages) {
     if (!m || typeof m !== "object") continue;
     const item = { ...m };
     if (item.role === "developer") item.role = "system";
     if (item.role === "system") {
-      hasSystem = true;
       item.cache_control = { type: "ephemeral" };
-      // 注入官方 Buffy 前缀（服务器 hasFreebuffRootSystemPromptOpening 字节级校验）。
-      // 字符串和数组(content 为 [{type:'text',text}]，OpenAI SDK 常见)都要处理。
-      if (typeof item.content === "string") {
-        if (!item.content.startsWith(BUFFY)) item.content = BUFFY + item.content;
-      } else if (Array.isArray(item.content)) {
-        const firstText = item.content.find((c) => c && c.type === "text" && typeof c.text === "string");
-        if (firstText && !firstText.text.startsWith(BUFFY)) firstText.text = BUFFY + firstText.text;
+      if (!prefixedSystem) {
+        item.content = withBase3Prefix(item.content, prompt);
+        prefixedSystem = true;
       }
     }
     out.push(item);
   }
-  if (!hasSystem) out.unshift({ role: "system", content: BUFFY, cache_control: { type: "ephemeral" } });
+  if (!prefixedSystem) out.unshift({ role: "system", content: prompt, cache_control: { type: "ephemeral" } });
   return out;
 }
 
@@ -1068,22 +802,32 @@ const REASONING_EFFORT_RANK = ["minimal", "low", "medium", "high", "xhigh", "max
 
 // 官方 per-model efforts：
 //   - deepseek-v4-flash: [low, high, max]（无 medium）
-//   - deepseek-v4-pro:   [high, max]
-//   - gpt-5.6-luna:      EFFORTS_THROUGH_MAX（low..max）
-//   - muse-spark:        EFFORTS_THROUGH_XHIGH（low..xhigh，ALWAYS reasons，none=400）
+//   - deepseek-v4-pro:   [low, high, max]
+//   - gpt-5.6-luna:      EFFORTS_THROUGH_MAX（low..max，含 xhigh）
+//   - muse-spark:        EFFORTS_THROUGH_XHIGH（minimal..xhigh）
+//   - claude-fable-5:    EFFORTS_THROUGH_MAX（仅保留参数校正规则，不在普通目录中）
 //   - minimax-m3:        无 effort（官方 adaptive/disabled thinking，不设档位）
 //   - 未列出的模型：无限制，原样透传
 const MODEL_EFFORTS = {
   "deepseek/deepseek-v4-flash": ["low", "high", "max"],
-  "deepseek/deepseek-v4-pro": ["high", "max"],
-  "openai/gpt-5.6-luna": ["low", "medium", "high", "max"],
-  "meta/muse-spark-1.2-contributor": ["low", "medium", "high", "xhigh"],
+  "deepseek/deepseek-v4-pro": ["low", "high", "max"],
+  "openai/gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
+  "meta/muse-spark-1.2-contributor": ["minimal", "low", "medium", "high", "xhigh"],
+  "anthropic/claude-fable-5": ["low", "medium", "high", "xhigh", "max"],
 };
 
-function clampReasoningEffort(requested, allowed) {
-  if (!Array.isArray(allowed) || allowed.length === 0) return requested;
+const MODEL_EFFORT_DEFAULTS = {
+  "deepseek/deepseek-v4-flash": "high",
+  "deepseek/deepseek-v4-pro": "high",
+  "openai/gpt-5.6-luna": "high",
+  "meta/muse-spark-1.2-contributor": "xhigh",
+  "anthropic/claude-fable-5": "high",
+};
+
+function clampReasoningEffort(requested, allowed, fallback) {
+  if (!Array.isArray(allowed) || allowed.length === 0) return fallback;
   const wanted = REASONING_EFFORT_RANK.indexOf(requested);
-  if (wanted < 0) return requested; // 未知档位 → 原样透传，交由上游
+  if (wanted < 0) return fallback;
   let best = null;
   let bestRank = -1;
   for (const cand of allowed) {
@@ -1101,15 +845,34 @@ function normalizeReasoningEffort(model, effort) {
   if (effort === undefined || effort === null) return effort;
   const allowed = MODEL_EFFORTS[model];
   if (!allowed) return effort; // 模型未列 → 不干预
-  const clamped = clampReasoningEffort(String(effort), allowed);
+  // Official compatibility rule: both DeepSeek V4 models map medium to high;
+  // the generic downward clamp would otherwise turn it into low.
+  if (effort === "medium" &&
+      (model === "deepseek/deepseek-v4-flash" || model === "deepseek/deepseek-v4-pro")) {
+    return "high";
+  }
+  const clamped = clampReasoningEffort(String(effort), allowed, MODEL_EFFORT_DEFAULTS[model]);
   return clamped === String(effort) ? effort : clamped;
 }
 
 function newClientSessionId() {
-  return crypto.randomUUID().replaceAll("-", "").slice(0, 13);
+  return Math.random().toString(36).substring(2, 15);
 }
 
-function buildUpstreamPayload(params, mc, sess, runId, clientSessionId) {
+function traceSessionFor(previousResponseId) {
+  if (previousResponseId) {
+    const previous = responseTraceCache.get(previousResponseId);
+    if (previous?.traceSessionId) return previous.traceSessionId;
+  }
+  return crypto.randomUUID();
+}
+
+function rememberResponseTrace(responseId, traceSessionId) {
+  if (!responseId || !traceSessionId) return;
+  responseTraceCache.set(responseId, { traceSessionId, checkedAt: Date.now() });
+}
+
+function buildUpstreamPayload(params, mc, sess, runId, clientSessionId, traceSessionId, llmStepNumber) {
   const payload = {};
   for (const k of UPSTREAM_KEYS) if (params[k] !== undefined && params[k] !== null) payload[k] = params[k];
   // reasoning_effort 按官方模型 efforts 表 clamp-down（不拒绝、不换模型）
@@ -1123,95 +886,28 @@ function buildUpstreamPayload(params, mc, sess, runId, clientSessionId) {
   payload.provider = { data_collection: "deny" };
   payload.codebuff_metadata = {
     freebuff_instance_id: sess.instanceId,
-    trace_session_id: crypto.randomUUID(),
+    trace_session_id: traceSessionId,
     run_id: runId,
     // Official SDK semantics: client_id is the per-prompt client session id.
     // Do not substitute a hardware fingerprint or a reused run id here.
     client_id: clientSessionId,
     cost_mode: "free",
+    llm_step_number: String(llmStepNumber),
   };
   return payload;
-}
-
-// 第一阶段显式代码审计模式：只在调用方明确请求时触发 reviewer 子 run。
-// 普通 chat 永远只使用 root agent，不把 reviewer 当成模型 fallback。
-function isCodeReviewRequest(params) {
-  return params && params.metadata && params.metadata.freebuff_mode === "code_review";
-}
-
-function buildReviewerMessages(params) {
-  const messages = Array.isArray(params.messages)
-    ? params.messages.map((m) => ({ ...m }))
-    : [];
-  // 与官方 createReviewer() 对齐：reviewer 继承 root 上下文，但不能调用工具或修改文件。
-  messages.unshift({
-    role: "system",
-    content: "You are a subagent that reviews code changes and gives helpful critical feedback. Do not use any tools. Review the last file changes made by the assistant. Focus on missing requirements, correctness, regressions, dead code, missing imports, and consistency with the existing code. Be extremely concise and only suggest changes; do not modify files.",
-  });
-  const requestedPrompt = params.metadata && typeof params.metadata.freebuff_review_prompt === "string"
-    ? params.metadata.freebuff_review_prompt.trim()
-    : "";
-  messages.push({
-    role: "user",
-    content: requestedPrompt ||
-      "Review the recent code changes in the conversation. Give concise, critical feedback only.",
-  });
-  return messages;
-}
-
-function buildReviewerPayload(params, mc, sess, reviewerRunId, clientSessionId) {
-  const metadata = params.metadata && typeof params.metadata === "object"
-    ? { ...params.metadata }
-    : undefined;
-  if (metadata) {
-    delete metadata.freebuff_mode;
-    delete metadata.freebuff_review_prompt;
-  }
-  return buildUpstreamPayload(
-    {
-      ...params,
-      metadata,
-      messages: buildReviewerMessages(params),
-      // 官方 code-reviewer 的 toolNames=[]：reviewer 只能给建议，不能调用工具。
-      tools: undefined,
-      tool_choice: undefined,
-      parallel_tool_calls: undefined,
-    },
-    mc,
-    sess,
-    reviewerRunId,
-    clientSessionId,
-  );
 }
 
 // ---------------------------------------------------------------------------
 // chat 主流程
 // ---------------------------------------------------------------------------
 
-// 查找模型配置：硬编码 MODELS 优先，动态表补充（合并表）
+// Only the ordinary CLI picker catalog is advertised and accepted. Account-
+// specific limited offers cannot be proven without creating/refreshing a session.
 function findModelConfig(modelId) {
-  const hit = MODELS.find((m) => m.id === modelId);
-  if (hit) return hit;
-  const dyn = dynamicModelsCache.models;
-  if (dyn) {
-    const d = dyn.find((m) => m.id === modelId);
-    if (d) return d;
-  }
-  return null;
+  return MODELS.find((model) => model.id === modelId) || null;
 }
 
-// 查找模型配置前确保动态注册表已加载。
-// 不能依赖 /v1/models 先被调用：Cloudflare 不保证两个请求落在同一 isolate。
 async function resolveModelConfig(modelId) {
-  let hit = findModelConfig(modelId);
-  if (hit) return hit;
-  try {
-    const dyn = await refreshDynamicModelsIfStale();
-    if (dyn && dyn.models) {
-      hit = dyn.models.find((m) => m.id === modelId) || null;
-      if (hit) return hit;
-    }
-  } catch {}
   return findModelConfig(modelId);
 }
 
@@ -1222,7 +918,7 @@ async function handleChat(request, env) {
   const requestedModel = params.model || DEFAULT_MODEL;
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
-  return executeChat(env, params, mc, isStream, "chat");
+  return executeChat(env, params, mc, isStream, "chat", request.signal);
 }
 
 // OpenAI Responses API（/v1/responses）入口：把 Responses 请求翻译成 chat completions 上游调用
@@ -1233,7 +929,7 @@ async function handleResponses(request, env) {
   const requestedModel = params.model || DEFAULT_MODEL;
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
-  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses");
+  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses", request.signal);
 }
 
 // Responses API 请求 → chat completions 参数（字段名/结构翻译）
@@ -1273,6 +969,7 @@ function responsesToChatParams(params, mc) {
   }
   chat.model = mc.id;
   chat.messages = responsesInputToMessages(params.input, params.instructions);
+  if (params.previous_response_id) chat.__previous_response_id = params.previous_response_id;
   return chat;
 }
 
@@ -1289,8 +986,27 @@ function responsesInputToMessages(input, instructions) {
       messages.push({ role: "tool", tool_call_id: item.call_id || "", content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "") });
       continue;
     }
-    // function_call / reasoning / item_reference 等条目本地无法执行/回溯，跳过
-    if (item.type === "function_call" || item.type === "reasoning" || item.type === "item_reference") continue;
+    if (item.type === "function_call") {
+      const toolCall = {
+        id: item.call_id || item.id || `call_${Math.random().toString(36).slice(2, 10)}`,
+        type: "function",
+        function: {
+          name: item.name || "",
+          arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}),
+        },
+      };
+      // Responses 可连续返回多个 function_call；合并成一条 assistant
+      // message，确保后续 function_call_output 都有合法的调用上下文。
+      const previous = messages.at(-1);
+      if (previous?.role === "assistant" && previous.content === null && Array.isArray(previous.tool_calls)) {
+        previous.tool_calls.push(toolCall);
+      } else {
+        messages.push({ role: "assistant", content: null, tool_calls: [toolCall] });
+      }
+      continue;
+    }
+    // reasoning / item_reference 没有可安全翻译成 Chat Completions 的内容。
+    if (item.type === "reasoning" || item.type === "item_reference") continue;
     const role = item.role || "user";
     const content = item.content;
     if (typeof content === "string") { messages.push({ role, content }); continue; }
@@ -1309,249 +1025,193 @@ function responsesInputToMessages(input, instructions) {
   return messages;
 }
 
-// 第一阶段：显式代码审计模式。
-// 这是 reviewer-only 入口：创建 root run 作为父链，再创建 code-reviewer 子 run，
-// 不执行普通 root chat，也不把 reviewer agent 混入普通模型路由。
-async function executeCodeReview(env, chatParams, mc, isStream, mode) {
-  const debug = env.FREEBUFF_DEBUG === "true";
-  const reviewerAgent = mc.reviewer_agent;
-  const reviewerModel = mc.upstream;
-  if (!reviewerAgent) {
-    return jsonResponse({
-      error: {
-        message: "Code review is not available for model: " + mc.id,
-        type: "unsupported_review_agent",
-      },
-    }, 400);
-  }
-
-  const pool = parseAccounts(env);
-  if (pool.length === 0) {
-    return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
-  }
-
-  let lastErrMsg = "";
-  for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-    const acct = pickToken(env, mc.session);
-    const token = acct ? acct.token : null;
-    if (!token) break;
-    logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
-      isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
-    let rootRunId = null;
-    let reviewerRunId = null;
-    let rootRunChain = null;
-    try {
-      const clientSessionId = newClientSessionId();
-      await runOfficialClientBehavior(token, env, chatParams, clientSessionId);
-      const sess = await createSession(token, mc.session);
-      const root = await startRunChain(token, mc.root_agent || mc.agent);
-      rootRunChain = root;
-      rootRunId = root.runId;
-      // Desktop 协议的关键：reviewer 是 root run 的子 run。
-      reviewerRunId = await startRun(token, reviewerAgent, [rootRunId]);
-      if (debug) console.log(`[review][acct ${acctTry + 1}] root=${rootRunId} reviewer=${reviewerRunId} model=${reviewerModel}`);
-
-      const payload = buildReviewerPayload(chatParams, { ...mc, upstream: reviewerModel }, sess, reviewerRunId, clientSessionId);
-      const headers = {
-        Authorization: "Bearer " + token,
-        "Content-Type": "application/json",
-        "User-Agent": "ai-sdk/openai-compatible/0.0.149/codebuff",
-        "x-freebuff-instance-id": sess.instanceId,
-      };
-      const resp = await fetch(codebuffApi() + "/api/v1/chat/completions", {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: isStream ? undefined : AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
-      });
-      if (!resp.ok) {
-        const text = await resp.text();
-        recordAccountObservation(token, resp.status, text);
-        lastErrMsg = "reviewer upstream error: " + text.slice(0, 300);
-        cooldown(token, parseCooldown(text, resp.status));
-        throw new Error(lastErrMsg);
-      }
-
-      let finalized = false;
-      const finalize = async () => {
-        if (finalized) return;
-        finalized = true;
-        if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-        await finishRunChain(token, rootRunChain, 1);
-      };
-
-      if (isStream) {
-        const { readable, writable } = new TransformStream();
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finalize);
-        else pipeUpstreamToClient(resp.body, writable, finalize);
-        return new Response(readable, {
-          status: 200,
-          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
-        });
-      }
-
-      const result = mode === "responses"
-        ? await responsesToNonStream(resp.body, mc)
-        : await streamToNonStream(resp.body, reviewerModel);
-      await finalize();
-      return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
-    } catch (e) {
-      console.error("[code_review]", e);
-      lastErrMsg = String(e.message || e);
-      if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
-      await finishRunChain(token, rootRunChain, 1);
-      if (/start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg)) cooldown(token, 60 * 1000);
-    }
-  }
-  return jsonResponse({ error: { message: lastErrMsg || "code reviewer failed", type: "api_error" } }, 502);
-}
-
-// chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
-async function executeChat(env, chatParams, mc, isStream, mode) {
-  if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode);
+// chat completions 与 responses 共用的上游执行。完整请求生命周期全局串行；
+// session gate 按官方 error+status wire contract 原样终止，不自动抢 session 或换号。
+async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSignal) {
   const debug = env.FREEBUFF_DEBUG === "true";
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
 
-  // 请求内多号重试：一个号失败（超时/429/428 重建无效/run 失败）立即冷却并换下一个号，最多试完整个账号池。
-  // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
+  let releaseChatSlot;
+  try {
+    releaseChatSlot = await acquireChatSlot(requestAbortSignal);
+  } catch (error) {
+    return jsonResponse({ error: { message: String(error?.message || "Request aborted"), type: "cancelled" } }, 499);
+  }
+
+  let slotTransferredToStream = false;
   let lastErrMsg = "";
   let lastStatus = 502;
   const clientSessionId = newClientSessionId();
-  for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-    const acct = pickToken(env, mc.session);
-    const token = acct ? acct.token : null;
-    if (!token) break;
-    logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
-      isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
-    let finishCurrentRun = async () => {};
-    try {
-      await runOfficialClientBehavior(token, env, chatParams, clientSessionId);
-      // 1) session
-      const sess = await createSession(token, mc.session);
-      if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
+  const previousResponseId = mode === "responses" ? chatParams.__previous_response_id || null : null;
+  const traceSessionId = traceSessionFor(previousResponseId);
+  const attemptedTokens = new Set();
 
-      // 2) run 链
-      const run = await startRunChain(token, mc.agent);
-      if (debug) console.log(`[acct ${acctTry + 1}] run=${run.runId}`);
+  try {
+    for (let acctTry = 0; acctTry < pool.length; acctTry++) {
+      const acct = pickToken(env, mc.session, attemptedTokens);
+      const token = acct ? acct.token : null;
+      if (!token) break;
+      attemptedTokens.add(token);
+      logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
+        isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
+
+      let run = null;
+      let step = null;
+      let stepCompleted = false;
       let runFinalized = false;
-      finishCurrentRun = async () => {
-        if (runFinalized) return;
+      const completeCurrentStep = (messageId = null) => {
+        if (stepCompleted || !run || !step) return;
+        stepCompleted = true;
+        completeRunStep(run, step, messageId);
+      };
+      const finishCurrentRun = async (status, errorMessage) => {
+        if (runFinalized || !run) return;
         runFinalized = true;
-        await finishRunChain(token, run, 1);
+        await finishRunChain(token, run, status, errorMessage);
       };
 
-      // 3) chat（428 waiting_room_required / 409 session_superseded = session 失效，
-      //    清缓存强制重建后重试一次；仍失败则冷却该号交给外层换号）
-      let resp, errText = "", sessForChat = sess;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId, clientSessionId);
+      try {
+        const sess = await createSession(token, mc.session, false, requestAbortSignal);
+        if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
+
+        // CLI 0.0.149 uses one base3 root run: no context-pruner and no reviewer.
+        run = await startRunChain(token, mc.agent, requestAbortSignal);
+        if (debug) console.log(`[acct ${acctTry + 1}] run=${run.runId} agent=${mc.agent}`);
+        step = beginRunStep(run);
+
+        const payload = buildUpstreamPayload(
+          chatParams,
+          mc,
+          sess,
+          run.runId,
+          clientSessionId,
+          traceSessionId,
+          step.stepNumber,
+        );
         const headers = {
           Authorization: "Bearer " + token,
           "Content-Type": "application/json",
           "User-Agent": "ai-sdk/openai-compatible/0.0.149/codebuff",
-          "x-freebuff-instance-id": sessForChat.instanceId,
+          "x-freebuff-instance-id": sess.instanceId,
         };
-        // x-freebuff-acting-user-id：⚠️ 实测（2026-08-10）不带它 chat 才能过（200），
-        // 带上反而 409 session_superseded（"Another instance of freebuff has taken over
-        // this session. Only one instance per account is allowed."）。
-        // 原因：预生成 instance-id 已把 session 绑定到 token 自身，再带 acting-user-id
-        // 会让服务端以为存在第二个实例抢同一 slot。桌面版默认也不带此头（仅模拟
-        // 他人才带）。因此这里不再发送 acting-user-id。
-        if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
-        const chatInit = {
-          method: "POST", headers, body: JSON.stringify(payload),
-        };
-        try {
-          resp = isStream
-            ? await fetchStreamWithQuotaGuard(codebuffApi() + "/api/v1/chat/completions", chatInit, token, mc.session)
-            : await fetch(codebuffApi() + "/api/v1/chat/completions", {
-                ...chatInit,
-                signal: AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
-              });
-        } catch (error) {
-          // 空流只视为当前账号的同模型 session 疑似脏状态：
-          // 删除上游旧实例，重建同模型 session，再重试一次；绝不改成别的模型。
-          if (error instanceof EmptyUpstreamStreamError && attempt === 0) {
-            await deleteUpstreamSession(token, sessForChat.instanceId);
-            if (debug) console.log(`[acct ${acctTry + 1}][chat] empty stream, same-model session recovery`);
-            sessForChat = await createSession(token, mc.session, true);
-            continue;
+        const chatInit = { method: "POST", headers, body: JSON.stringify(payload) };
+        const resp = isStream
+          ? await fetchStreamWithQuotaGuard(
+              codebuffApi() + "/api/v1/chat/completions",
+              chatInit,
+              token,
+              mc.session,
+              requestAbortSignal,
+            )
+          : await fetch(codebuffApi() + "/api/v1/chat/completions", {
+              ...chatInit,
+              signal: requestSignal(NONSTREAM_TIMEOUT_MS, requestAbortSignal),
+            });
+
+        if (!resp.ok) {
+          const errText = await resp.text();
+          lastStatus = resp.status;
+          const gateCode = getSessionGateCode(resp.status, errText);
+          // Gate 429 is a transient admission race, not an account rate limit.
+          // Keep gate responses out of the generic account-health classifier.
+          if (!gateCode) recordAccountObservation(token, resp.status, errText);
+          await finishCurrentRun("failed", gateCode || errText);
+
+          if (gateCode) {
+            if (SESSION_GATE_CODES[gateCode].endsSession) {
+              sessCache.delete(token + ":" + mc.session);
+            }
+            if (gateCode === "session_superseded") supersededTokens.add(token);
+            let parsed = null;
+            try { parsed = JSON.parse(errText); } catch {}
+            const message = parsed?.message || gateCode;
+            if (debug) console.log(`[acct ${acctTry + 1}] terminal session gate=${gateCode}`);
+            return jsonResponse({ error: { message, type: "api_error", code: gateCode } }, resp.status);
           }
-          throw error;
-        }
-        if (resp.ok) {
-          recordAccountObservation(token, resp.status, null);
-          break;
-        }
-        errText = await resp.text();
-        lastStatus = resp.status;
-        recordAccountObservation(token, resp.status, errText);
-        // 428 waiting_room_required（无活跃 session）/ 409 session_superseded（被新 session 顶替）
-        // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却
-        const staleSession =
-          isStaleSessionGate(resp.status, errText) ||
-          // Older upstream wrappers returned model mismatch as HTTP 502.
-          (resp.status === 502 && (errText.includes("session_model_mismatch") || errText.includes("not valid for limited access")));
-        if (staleSession && attempt === 0) {
-          await deleteUpstreamSession(token, sessForChat.instanceId);
-          if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
-          sessForChat = await createSession(token, mc.session, true);
+
+          lastErrMsg = "upstream error: " + errText.slice(0, 300);
+          if (!shouldRotateAccount(resp.status)) {
+            return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, resp.status);
+          }
+          cooldown(token, mc.session, parseCooldown(errText, resp.status));
+          if (debug) console.log(`[acct ${acctTry + 1}] failed ${resp.status}, switch account`);
           continue;
         }
-        // 重建后仍失败：该号 session 状态异常，冷却交给外层换号
-        if (staleSession) cooldown(token, 60 * 1000);
-        cooldown(token, parseCooldown(errText, resp.status));
-        break;
-      }
-      if (!resp.ok) {
-        lastErrMsg = "upstream error: " + (errText || "").slice(0, 300);
-        await finishCurrentRun();
-        if (debug) console.log(`[acct ${acctTry + 1}] failed ${resp.status}, switch account`);
-        continue;
-      }
 
-      if (isStream) {
-        const { readable, writable } = new TransformStream();
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finishCurrentRun);
-        else pipeUpstreamToClient(resp.body, writable, finishCurrentRun);
-        return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
-      }
+        recordAccountObservation(token, resp.status, null);
+        const finalizeStream = async (streamError) => {
+          const aborted = requestAbortSignal?.aborted;
+          const status = aborted ? "cancelled" : streamError ? "failed" : "completed";
+          if (status === "completed") completeCurrentStep();
+          await finishCurrentRun(status, streamError ? String(streamError?.message || streamError) : undefined);
+          releaseChatSlot();
+        };
 
-      if (mode === "responses") {
-        const result = await responsesToNonStream(resp.body, mc);
-        await finishCurrentRun();
+        if (isStream) {
+          const { readable, writable } = new TransformStream();
+          slotTransferredToStream = true;
+          if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finalizeStream, previousResponseId, traceSessionId);
+          else pipeUpstreamToClient(resp.body, writable, finalizeStream);
+          return new Response(readable, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
+          });
+        }
+
+        const result = mode === "responses"
+          ? await responsesToNonStream(resp.body, mc, previousResponseId)
+          : await streamToNonStream(resp.body, mc.upstream);
+        if (mode === "responses") rememberResponseTrace(result.id, traceSessionId);
+        completeCurrentStep();
+        await finishCurrentRun("completed");
         return jsonResponse(result, 200);
-      }
+      } catch (error) {
+        const aborted = requestAbortSignal?.aborted;
+        await finishCurrentRun(aborted ? "cancelled" : "failed", String(error?.message || error));
+        if (aborted) {
+          return jsonResponse({ error: { message: "Request aborted", type: "cancelled" } }, 499);
+        }
 
-      const agg = await streamToNonStream(resp.body, mc.upstream);
-      await finishCurrentRun();
-      return jsonResponse(agg, 200);
-    } catch (e) {
-      console.error("[" + mode + "]", e);
-      await finishCurrentRun();
-      const msg = String(e.message || e);
-      const statusMatch = msg.match(/\b(?:failed|error|upstream error:)\s*:?\s*(4\d{2}|5\d{2})\b/i);
-      if (statusMatch) lastStatus = Number(statusMatch[1]);
-      // 额度探测确认耗尽：清除当前模型 session，按上游 retryAfterMs 冷却后切号。
-      if (e instanceof QuotaExhaustedError) {
-        sessCache.delete(token + ":" + mc.session);
-        cooldown(token, e.retryAfterMs || 5 * 60 * 1000);
+        console.error("[" + mode + "]", error);
+        const msg = String(error?.message || error);
+        if (error instanceof UpstreamProtocolError) {
+          lastErrMsg = msg;
+          lastStatus = 502;
+          return jsonResponse({ error: { message: msg, type: "upstream_protocol_error" } }, 502);
+        }
+        const statusMatch = msg.match(/\b(?:failed|error|upstream error:)\s*:?\s*(4\d{2}|5\d{2})\b/i);
+        if (statusMatch) lastStatus = Number(statusMatch[1]);
+        if (error instanceof QuotaExhaustedError) {
+          sessCache.delete(token + ":" + mc.session);
+          cooldown(token, mc.session, error.retryAfterMs || 5 * 60 * 1000);
+        } else if (error instanceof EmptyUpstreamStreamError) {
+          // No evidence that an empty response makes the session stale: keep it
+          // intact and let a later client request retry normally.
+          cooldown(token, mc.session, 60 * 1000);
+        } else if (error instanceof SessionOwnedElsewhereError) {
+          cooldown(token, mc.session, 5 * 60 * 1000);
+        } else if (/create session failed|stayed queued|start_run failed|abort|timeout|timed out|terminated/i.test(msg)) {
+          cooldown(token, mc.session, /429/.test(msg) ? parseCooldown(msg, 429) : 60 * 1000);
+        }
+        lastErrMsg = msg;
+        if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
       }
-      if (e instanceof EmptyUpstreamStreamError) {
-        cooldown(token, 60 * 1000);
-      }
-      // 其他上游交互失败/超时继续沿用原有冷却逻辑；流式 chat 不再因固定 20s abort 进入这里。
-      // createSession 429（额度耗尽）按 retryAfterMs/文本冷却，不能固定 60s。
-      if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
-        const m429 = msg.match(/429/);
-        cooldown(token, m429 ? parseCooldown(msg, 429) : 60 * 1000);
-      }
-      lastErrMsg = msg;
-      if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
     }
+
+    const retryAfterMs = poolRetryAfterMs(pool, mc.session);
+    if (!lastErrMsg && retryAfterMs !== null) {
+      lastErrMsg = "all configured accounts are cooling down";
+      lastStatus = 429;
+    } else if (!lastErrMsg && attemptedTokens.size === 0) {
+      lastErrMsg = "no eligible Freebuff account is available";
+      lastStatus = 503;
+    }
+    const headers = retryAfterMs === null ? {} : { "Retry-After": String(Math.max(1, Math.ceil(retryAfterMs / 1000))) };
+    return jsonResponse({ error: { message: lastErrMsg || "upstream request failed", type: "api_error" } }, lastStatus, headers);
+  } finally {
+    if (!slotTransferredToStream) releaseChatSlot();
   }
-  return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, lastStatus);
 }
 
 
@@ -1727,7 +1387,7 @@ async function handleAnthropicMessages(request, env) {
   const mc = findModelConfig(openaiModel);
   if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
-  const response = await executeChat(env, chat, mc, !!chat.stream, "chat");
+  const response = await executeChat(env, chat, mc, !!chat.stream, "chat", request.signal);
   if (response.status >= 400) {
     let msg = "Upstream error"; try { const data = await response.json(); msg = data?.error?.message || msg; } catch {}
     const types = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 429: "rate_limit_error", 503: "overloaded_error" };
@@ -1744,37 +1404,122 @@ function unwrapData(obj) {
   return obj;
 }
 
+class UpstreamProtocolError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UpstreamProtocolError";
+  }
+}
+
+function parseSseBlock(block) {
+  const dataLines = [];
+  for (const rawLine of block.split(/\r?\n/)) {
+    if (rawLine === "" || rawLine.startsWith(":")) continue;
+    if (rawLine === "data") dataLines.push("");
+    else if (rawLine.startsWith("data:")) dataLines.push(rawLine.slice(5).replace(/^ /, ""));
+  }
+  if (dataLines.length === 0) return null;
+  return dataLines.join("\n").trim();
+}
+
+// 严格而增量地读取 SSE：支持 CRLF、跨 chunk 事件以及末尾没有换行的
+// 最后一个事件。无效 JSON 不再被静默吞掉并伪装成 completed。
+async function* readUpstreamSse(body) {
+  if (!body) throw new EmptyUpstreamStreamError();
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let sawData = false;
+
+  const decodeBlock = (block) => {
+    const payload = parseSseBlock(block);
+    if (payload === null || payload === "") return null;
+    sawData = true;
+    if (payload === "[DONE]") return { done: true, obj: null };
+    try {
+      return { done: false, obj: unwrapData(JSON.parse(payload)) };
+    } catch (error) {
+      throw new UpstreamProtocolError(`invalid upstream SSE JSON: ${String(error?.message || error)}`);
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let separator;
+      while ((separator = /\r?\n\r?\n/.exec(buffer)) !== null) {
+        const block = buffer.slice(0, separator.index);
+        buffer = buffer.slice(separator.index + separator[0].length);
+        const event = decodeBlock(block);
+        if (event) yield event;
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() !== "") {
+      const event = decodeBlock(buffer);
+      if (event) yield event;
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  if (!sawData) throw new EmptyUpstreamStreamError();
+}
+
+function mergeToolCall(toolCalls, tc) {
+  if (!tc || typeof tc !== "object") return;
+  const index = Number.isInteger(tc.index) ? tc.index : 0;
+  let item = toolCalls.get(index);
+  if (!item) {
+    item = { index, id: "", type: "function", name: "", arguments: "" };
+    toolCalls.set(index, item);
+  }
+  const fn = tc.function || {};
+  if (tc.id) item.id = tc.id;
+  if (tc.type) item.type = tc.type;
+  if (fn.name) item.name += fn.name;
+  if (fn.arguments) item.arguments += fn.arguments;
+}
+
+function openAiToolCalls(toolCalls) {
+  return [...toolCalls.values()].map((item) => ({
+    id: item.id || `call_${Math.random().toString(36).slice(2, 10)}`,
+    type: item.type || "function",
+    function: { name: item.name, arguments: item.arguments },
+  }));
+}
+
 // 流式：把上游 SSE 剥 {data:...} 包装后透传
 function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
-  const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
-  const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  let buf = "";
   (async () => {
+    let streamError = null;
+    let sawDone = false;
+    let sawFinish = false;
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-          if (line.startsWith("data:")) {
-            const payload = line.slice(5).trim();
-            if (payload === "" || payload === "[DONE]") { await writer.write(encoder.encode(line + "\n\n")); continue; }
-            try {
-              const normalized = unwrapData(JSON.parse(payload));
-              await writer.write(encoder.encode("data: " + JSON.stringify(normalized) + "\n\n"));
-            } catch { await writer.write(encoder.encode(line + "\n")); }
-          } else {
-            await writer.write(encoder.encode(line + "\n"));
-          }
+      for await (const event of readUpstreamSse(upstreamBody)) {
+        if (event.done) {
+          sawDone = true;
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+          continue;
         }
+        const choice = event.obj?.choices?.[0];
+        if (choice?.finish_reason) sawFinish = true;
+        await writer.write(encoder.encode("data: " + JSON.stringify(event.obj) + "\n\n"));
       }
-    } catch {}
+      if (!sawDone && !sawFinish) throw new UpstreamProtocolError("upstream SSE ended before finish_reason or [DONE]");
+      if (!sawDone) await writer.write(encoder.encode("data: [DONE]\n\n"));
+    } catch (error) {
+      streamError = error;
+      try {
+        await writer.write(encoder.encode("data: " + JSON.stringify({ error: { message: String(error?.message || error), type: "upstream_protocol_error" } }) + "\n\n"));
+        if (!sawDone) await writer.write(encoder.encode("data: [DONE]\n\n"));
+      } catch {}
+    }
     finally {
-      try { if (onComplete) await onComplete(); } catch {}
+      try { if (onComplete) await onComplete(streamError); } catch {}
       try { await writer.close(); } catch {}
     }
   })();
@@ -1782,34 +1527,29 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
 
 // 非流式：聚合上游流成 OpenAI 非流式对象
 async function streamToNonStream(upstreamBody, upstreamModel) {
-  const reader = upstreamBody.getReader();
-  const decoder = new TextDecoder();
-  let buf = "", content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let idx;
-    while ((idx = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-      if (!line.startsWith("data:")) continue;
-      const payload = line.slice(5).trim();
-      if (payload === "" || payload === "[DONE]") continue;
-      try {
-        const obj = unwrapData(JSON.parse(payload));
-        const choice = obj?.choices?.[0];
-        if (!choice) continue;
-        const delta = choice.delta || {};
-        if (delta.content) content += delta.content;
-        if (delta.reasoning_content) reasoning += delta.reasoning_content;
-        if (choice.finish_reason) finishReason = choice.finish_reason;
-        if (obj.id) id = obj.id;
-        if (obj.model) model = obj.model;
-        if (obj.usage) usage = obj.usage;
-      } catch {}
+  let content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
+  let sawDone = false;
+  const toolCalls = new Map();
+  for await (const event of readUpstreamSse(upstreamBody)) {
+    if (event.done) { sawDone = true; continue; }
+    const obj = event.obj;
+    if (obj?.id) id = obj.id;
+    if (obj?.model) model = obj.model;
+    if (obj?.usage) usage = obj.usage;
+    const choice = obj?.choices?.[0];
+    if (!choice) continue;
+    const delta = choice.delta || {};
+    if (delta.content) content += delta.content;
+    if (delta.reasoning_content) reasoning += delta.reasoning_content;
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) mergeToolCall(toolCalls, tc);
     }
+    if (choice.finish_reason) finishReason = choice.finish_reason;
   }
-  const msg = { role: "assistant", content };
+  if (!sawDone && !finishReason) throw new UpstreamProtocolError("upstream SSE ended before finish_reason or [DONE]");
+  const mergedToolCalls = openAiToolCalls(toolCalls);
+  const msg = { role: "assistant", content: mergedToolCalls.length && !content ? null : content };
+  if (mergedToolCalls.length) msg.tool_calls = mergedToolCalls;
   if (reasoning && !content) { msg.content = reasoning; msg.reasoning_used_as_content = true; }
   else if (reasoning) msg.reasoning_content = reasoning;
   return {
@@ -1817,7 +1557,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model: model || upstreamModel,
-    choices: [{ index: 0, message: msg, finish_reason: finishReason || "stop", logprobs: null }],
+    choices: [{ index: 0, message: msg, finish_reason: finishReason || (mergedToolCalls.length ? "tool_calls" : "stop"), logprobs: null }],
     usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
 }
@@ -1826,7 +1566,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
 // Responses API（/v1/responses）输出
 // ---------------------------------------------------------------------------
 
-function responsesBase(mc, respId, createdAt) {
+function responsesBase(mc, respId, createdAt, previousResponseId = null) {
   return {
     id: respId || "resp_" + Math.random().toString(36).slice(2, 10),
     object: "response",
@@ -1839,7 +1579,7 @@ function responsesBase(mc, respId, createdAt) {
     model: mc.id,
     output: [],
     parallel_tool_calls: true,
-    previous_response_id: null,
+    previous_response_id: previousResponseId,
     reasoning: { effort: null, summary: null },
     store: true,
     temperature: 1.0,
@@ -1885,14 +1625,13 @@ function chatUsageToResponsesUsage(usage) {
 }
 
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
-async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete) {
-  const reader = upstreamBody.getReader();
+async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete, previousResponseId = null, traceSessionId = null) {
   const writer = writable.getWriter();
-  const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const respId = "resp_" + Math.random().toString(36).slice(2, 10);
   const createdAt = Math.floor(Date.now() / 1000);
-  let buf = "", model = "", usage = null;
+  rememberResponseTrace(respId, traceSessionId);
+  let model = "", usage = null, sawDone = false, finishReason = null;
   const send = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
 
   // 按上游出现顺序记录输出项：message（文本）或 function_call（工具调用）
@@ -1928,62 +1667,55 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
   };
 
   (async () => {
+    let streamError = null;
     try {
-      await send({ type: "response.created", response: responsesBase(mc, respId, createdAt) });
-      await send({ type: "response.in_progress", response: responsesBase(mc, respId, createdAt) });
+      await send({ type: "response.created", response: responsesBase(mc, respId, createdAt, previousResponseId) });
+      await send({ type: "response.in_progress", response: responsesBase(mc, respId, createdAt, previousResponseId) });
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-          if (!line.startsWith("data:")) continue;
-          const payload = line.slice(5).trim();
-          if (payload === "" || payload === "[DONE]") continue;
-          try {
-            const obj = unwrapData(JSON.parse(payload));
-            const choice = obj?.choices?.[0];
-            if (!choice) continue;
-            const delta = choice.delta || {};
-                if (obj.model) model = obj.model;
-                if (obj.usage) usage = obj.usage;
+      for await (const event of readUpstreamSse(upstreamBody)) {
+        if (event.done) { sawDone = true; continue; }
+        const obj = event.obj;
+        if (obj?.model) model = obj.model;
+        if (obj?.usage) usage = obj.usage;
+        const choice = obj?.choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta || {};
+        if (choice.finish_reason) finishReason = choice.finish_reason;
 
-            // 工具调用增量（chat 格式 delta.tool_calls[]）
-            if (Array.isArray(delta.tool_calls)) {
-              for (const tc of delta.tool_calls) {
-                if (!tc || typeof tc !== "object") continue;
-                const ti = tc.index ?? 0;
-                let item = toolItems.get(ti);
-                if (!item) {
-                  item = startTool(tc);
-                  toolItems.set(ti, item);
-                  await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
-                }
-                const fn = tc.function || {};
-                if (fn.name && !item.name) item.name = fn.name;
-                if (fn.arguments) {
-                  item.args += fn.arguments;
-                  await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: fn.arguments });
-                }
-              }
+        // 工具调用增量（chat 格式 delta.tool_calls[]）
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            if (!tc || typeof tc !== "object") continue;
+            const ti = tc.index ?? 0;
+            let item = toolItems.get(ti);
+            if (!item) {
+              item = startTool(tc);
+              toolItems.set(ti, item);
+              await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
             }
-
-            // 文本增量
-            if (delta.content) {
-              if (!contentItem) contentItem = startContent();
-              if (!contentItem.started) {
-                contentItem.started = true;
-                await send({ type: "response.output_item.added", output_index: contentItem.outputIndex, item: { id: contentItem.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
-                await send({ type: "response.content_part.added", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
-              }
-              contentItem.text += delta.content;
-              await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, delta: delta.content });
+            const fn = tc.function || {};
+            if (tc.id) item.callId = tc.id;
+            if (fn.name && item.name !== fn.name) item.name += fn.name;
+            if (fn.arguments) {
+              item.args += fn.arguments;
+              await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: fn.arguments });
             }
-          } catch {}
+          }
+        }
+
+        // 文本增量
+        if (delta.content) {
+          if (!contentItem) contentItem = startContent();
+          if (!contentItem.started) {
+            contentItem.started = true;
+            await send({ type: "response.output_item.added", output_index: contentItem.outputIndex, item: { id: contentItem.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
+            await send({ type: "response.content_part.added", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+          }
+          contentItem.text += delta.content;
+          await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, delta: delta.content });
         }
       }
+      if (!sawDone && !finishReason) throw new UpstreamProtocolError("upstream SSE ended before finish_reason or [DONE]");
 
       // 既无文本也无工具调用时补一个空 message，避免 output 为空数组
       if (items.length === 0) {
@@ -2005,11 +1737,12 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
           await send({ type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part });
           await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "completed", role: "assistant", content: [part] } });
         } else {
+          await send({ type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: item.args });
           await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args } });
         }
       }
 
-      const resp = responsesBase(mc, respId, createdAt);
+      const resp = responsesBase(mc, respId, createdAt, previousResponseId);
       resp.status = "completed";
       resp.model = model || mc.id;
       resp.output = items.map((item) =>
@@ -2019,63 +1752,45 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       );
       resp.usage = chatUsageToResponsesUsage(usage);
       await send({ type: "response.completed", response: resp });
-    } catch {}
+    } catch (error) {
+      streamError = error;
+      try {
+        const failed = responsesBase(mc, respId, createdAt, previousResponseId);
+        failed.status = "failed";
+        failed.error = { code: "upstream_protocol_error", message: String(error?.message || error) };
+        failed.model = model || mc.id;
+        failed.usage = chatUsageToResponsesUsage(usage);
+        await send({ type: "response.failed", response: failed });
+      } catch {}
+    }
     finally {
-      try { if (onComplete) await onComplete(); } catch {}
+      try { if (onComplete) await onComplete(streamError); } catch {}
       try { await writer.close(); } catch {}
     }
   })();
 }
 
 // 非流式：聚合上游流成 Responses API 非流式对象
-async function responsesToNonStream(upstreamBody, mc) {
-  const reader = upstreamBody.getReader();
-  const decoder = new TextDecoder();
-  let buf = "", model = "", outputText = "", reasoning = "", usage = null;
-  const toolItems = new Map(); // 上游 tool_calls index → {id, callId, name, args}
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let idx;
-    while ((idx = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-      if (!line.startsWith("data:")) continue;
-      const payload = line.slice(5).trim();
-      if (payload === "" || payload === "[DONE]") continue;
-      try {
-        const obj = unwrapData(JSON.parse(payload));
-        const choice = obj?.choices?.[0];
-        if (!choice) continue;
-        const delta = choice.delta || {};
-        if (delta.content) outputText += delta.content;
-        if (delta.reasoning_content) reasoning += delta.reasoning_content;
-        if (Array.isArray(delta.tool_calls)) {
-          for (const tc of delta.tool_calls) {
-            if (!tc || typeof tc !== "object") continue;
-            const ti = tc.index ?? 0;
-            let item = toolItems.get(ti);
-            if (!item) {
-              const fn = tc.function || {};
-              item = {
-                id: "fc_" + Math.random().toString(36).slice(2, 10),
-                callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
-                name: fn.name || "",
-                args: "",
-              };
-              toolItems.set(ti, item);
-            }
-            const fn = tc.function || {};
-            if (fn.name && !item.name) item.name = fn.name;
-            if (fn.arguments) item.args += fn.arguments;
-          }
-        }
-        if (obj.model) model = obj.model;
-        if (obj.usage) usage = obj.usage;
-      } catch {}
+async function responsesToNonStream(upstreamBody, mc, previousResponseId = null) {
+  let model = "", outputText = "", reasoning = "", usage = null, finishReason = null, sawDone = false;
+  const toolCalls = new Map();
+  for await (const event of readUpstreamSse(upstreamBody)) {
+    if (event.done) { sawDone = true; continue; }
+    const obj = event.obj;
+    if (obj?.model) model = obj.model;
+    if (obj?.usage) usage = obj.usage;
+    const choice = obj?.choices?.[0];
+    if (!choice) continue;
+    const delta = choice.delta || {};
+    if (delta.content) outputText += delta.content;
+    if (delta.reasoning_content) reasoning += delta.reasoning_content;
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) mergeToolCall(toolCalls, tc);
     }
+    if (choice.finish_reason) finishReason = choice.finish_reason;
   }
-  const resp = responsesBase(mc, undefined, Math.floor(Date.now() / 1000));
+  if (!sawDone && !finishReason) throw new UpstreamProtocolError("upstream SSE ended before finish_reason or [DONE]");
+  const resp = responsesBase(mc, undefined, Math.floor(Date.now() / 1000), previousResponseId);
   resp.status = "completed";
   resp.model = model || mc.id;
   resp.output = [];
@@ -2087,8 +1802,15 @@ async function responsesToNonStream(upstreamBody, mc) {
       content: [{ type: "output_text", text, annotations: [] }],
     });
   }
-  for (const item of toolItems.values()) {
-    resp.output.push({ id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args });
+  for (const item of openAiToolCalls(toolCalls)) {
+    resp.output.push({
+      id: "fc_" + Math.random().toString(36).slice(2, 10),
+      type: "function_call",
+      status: "completed",
+      call_id: item.id,
+      name: item.function.name,
+      arguments: item.function.arguments,
+    });
   }
   resp.usage = chatUsageToResponsesUsage(usage);
   return resp;
@@ -2099,7 +1821,7 @@ async function responsesToNonStream(upstreamBody, mc) {
 // 工具
 // ---------------------------------------------------------------------------
 
-// 轻量缓存清理：避免长时间运行后 Map 无限膨胀（Workers 无自动 GC）
+// 轻量缓存清理：避免 VPS 进程长时间运行后 Map 无限增长
 function cleanCache() {
   const now = Date.now();
   try {
@@ -2109,34 +1831,47 @@ function cleanCache() {
         if (exp > 0 && exp < now) sessCache.delete(k);
       }
     }
-    if (behaviorCache.size > 200) {
-      for (const [k, ts] of behaviorCache) {
-        if (now - ts > CLIENT_BEHAVIOR_TTL_MS * 2) behaviorCache.delete(k);
+    if (cooldowns.size > 200) {
+      for (const [key, until] of cooldowns) {
+        if (until <= now) cooldowns.delete(key);
+      }
+    }
+    if (responseTraceCache.size > 1000) {
+      for (const [responseId, context] of responseTraceCache) {
+        if (now - context.checkedAt > 2 * 60 * 60 * 1000) responseTraceCache.delete(responseId);
+      }
+      while (responseTraceCache.size > 1000) {
+        const oldest = responseTraceCache.keys().next().value;
+        if (oldest === undefined) break;
+        responseTraceCache.delete(oldest);
       }
     }
   } catch {}
 }
 
-// /v1/models 返回 硬编码 MODELS + 动态官方清单（合并去重）
-// ⚠️ 不要在这里查上游 GET /api/v1/freebuff/session（额度/状态）：
-// 该接口会占用账号 session，而 Freebuff 一个号同一时间只能一个客户端在线，
-// 查询会干扰/顶掉正在进行的 chat 会话（428 waiting_room_required）。
-async function handleModels() {
-  let modelList = MODELS;
-  try {
-    const dyn = await refreshDynamicModelsIfStale();
-    if (dyn && dyn.models && dyn.models.length) {
-      modelList = mergeModelTables(MODELS, dyn.models);
-    }
-  } catch {}
+// Return the ordinary CLI picker catalog only. Entitlement- and capacity-gated
+// offers are account/session state, not static model metadata.
+function visibleModelsForAccounts(env) {
+  const pool = parseAccounts(env);
+  const observed = pool.map((acct) => acctHealth.get(acct.token)).filter(Boolean);
+  // 只有所有账号都已被上游明确识别为 limited 时才收窄目录。任一账号
+  // 未知或具有更高 tier 时保留完整 picker，避免在首次启动时误隐藏模型。
+  if (observed.length === pool.length && observed.length > 0 && observed.every((info) => info.accessTier === "limited")) {
+    return MODELS.filter((model) => STANDARD_MODELS.has(model.id));
+  }
+  return MODELS;
+}
+
+async function handleModels(env) {
+  const visibleModels = visibleModelsForAccounts(env);
   return jsonResponse({
     object: "list",
-    data: modelList.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
+    data: visibleModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
   }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 
 function getApiKey(request, env) {
-  const expected = (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY).trim();
+  const expected = String(env.API_KEY || env.FREEBUFF_API_KEY || "").trim();
   if (!expected) return null;
   const auth = request.headers.get("Authorization") || "";
   if (auth.startsWith("Bearer ")) return auth.slice(7) === expected ? expected : null;

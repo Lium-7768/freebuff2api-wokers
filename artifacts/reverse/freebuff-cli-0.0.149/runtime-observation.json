@@ -1,0 +1,30 @@
+{
+  "agent_type": "base3-free-deepseek-flash",
+  "system_prompt": {
+    "length": 4393,
+    "sha256": "5e479a0316ae26af2f57eaaa4beec2b5284e26d07556037a7f75bebb15470101"
+  },
+  "tool_count": 15,
+  "message_count": 264,
+  "steps_remaining": 197,
+  "context_token_count": 152888,
+  "messages_by_role": {
+    "assistant": 189,
+    "tool": 69,
+    "user": 6
+  },
+  "content_types": {
+    "tool_call": 69,
+    "tool_result_json": 69,
+    "text": 64,
+    "reasoning": 62
+  },
+  "observed_runs": [
+    { "run": 1, "llm_steps": 2, "tool_calls": 2, "result": "completed" },
+    { "run": 2, "llm_steps": 4, "tool_calls": 5, "result": "completed" },
+    { "run": 3, "llm_steps": 53, "tool_calls": 54, "result": "completed" },
+    { "run": 4, "llm_steps": 6, "result": "cancelled_by_user_at_step_6" },
+    { "run": 5, "llm_steps": 4, "result": "upstream_428_at_step_4" }
+  ],
+  "privacy": "All token, UID, prompt content and filesystem paths were removed."
+}

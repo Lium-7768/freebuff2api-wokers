@@ -8,6 +8,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Load worker module
 const worker = await import('./worker.js');
 const handler = worker.default;
+const closeOwnedSessions = worker.closeOwnedSessions;
 
 // === Build env from config ===
 
@@ -36,37 +37,51 @@ if (envToken) {
   }
 }
 
+const apiKey = String(process.env.FREEBUFF_API_KEY || '').trim();
+if (!apiKey) {
+  throw new Error('FREEBUFF_API_KEY is required; refusing to start with a public default key');
+}
+
 const env = {
   FREEBUFF_TOKEN: tokenLines.join(','),
-  FREEBUFF_API_KEY: process.env.FREEBUFF_API_KEY || 'freebuff-default-key',
+  FREEBUFF_API_KEY: apiKey,
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
-  FREEBUFF_ADS_MODE: process.env.FREEBUFF_ADS_MODE || 'fetch',
-  FREEBUFF_CLI_VERSION: process.env.FREEBUFF_CLI_VERSION || '0.0.149',
   CODEBUFF_API: process.env.CODEBUFF_API || '',
-  RELAY_KEY: process.env.RELAY_KEY || '',
 };
 
-console.log(`[server] start: ${tokenLines.length} tokens, apiKeyConfigured=${Boolean(process.env.FREEBUFF_API_KEY)}, debug=${env.FREEBUFF_DEBUG}`);
+console.log(`[server] start: ${tokenLines.length} tokens, apiKeyConfigured=true, debug=${env.FREEBUFF_DEBUG}`);
 if (env.CODEBUFF_API) console.log(`[server] CODEBUFF_API=${env.CODEBUFF_API}`);
-if (env.RELAY_KEY) console.log(`[server] RELAY_KEY set`);
 
 // === HTTP server ===
 const port = parseInt(process.env.PORT || '8787', 10);
 const host = process.env.HOST || '0.0.0.0';
 
 const server = createServer(async (nodeReq, nodeRes) => {
+  const abortController = new AbortController();
+  const abortRequest = () => {
+    if (!abortController.signal.aborted) {
+      abortController.abort(new Error('downstream client disconnected'));
+    }
+  };
+  const abortOnResponseClose = () => {
+    if (!nodeRes.writableEnded) abortRequest();
+  };
+  nodeReq.once('aborted', abortRequest);
+  nodeRes.once('close', abortOnResponseClose);
+
   try {
     // Build array of raw bytes from Node request
     const chunks = [];
     for await (const chunk of nodeReq) chunks.push(chunk);
     const body = Buffer.concat(chunks);
 
-    // Build a CF-compatible Request
+    // Build a standard Web Request for the protocol adapter
     const url = `http://${nodeReq.headers.host || 'localhost'}${nodeReq.url}`;
     const request = new Request(url, {
       method: nodeReq.method,
       headers: new Headers(nodeReq.headers),
       body: body.length > 0 ? body : null,
+      signal: abortController.signal,
     });
 
     // Call the worker's fetch handler
@@ -90,6 +105,7 @@ const server = createServer(async (nodeReq, nodeRes) => {
     }
     if (!nodeRes.writableEnded) nodeRes.end();
   } catch (err) {
+    if (abortController.signal.aborted) return;
     console.error('[server] request error:', err.message);
     if (!nodeRes.headersSent) {
       nodeRes.writeHead(502, { 'content-type': 'application/json' });
@@ -97,9 +113,29 @@ const server = createServer(async (nodeReq, nodeRes) => {
     } else if (!nodeRes.writableEnded) {
       nodeRes.end();
     }
+  } finally {
+    nodeReq.off('aborted', abortRequest);
+    nodeRes.off('close', abortOnResponseClose);
   }
 });
 
 server.listen(port, host, () => {
   console.log(`[server] listening on ${host}:${port}`);
 });
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[server] ${signal}: shutting down`);
+  await new Promise((resolveClose) => server.close(resolveClose));
+  try {
+    await closeOwnedSessions();
+  } catch (error) {
+    console.error(`[server] session cleanup failed: ${error.message}`);
+  }
+  process.exit(0);
+}
+
+process.once('SIGINT', () => { void shutdown('SIGINT'); });
+process.once('SIGTERM', () => { void shutdown('SIGTERM'); });

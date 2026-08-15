@@ -1,0 +1,18 @@
+{
+  "runtime": "Node.js without Docker",
+  "upstream": "local mock server",
+  "initial_health_status": "degraded",
+  "requests": 4,
+  "endpoint": "/v1/responses",
+  "statuses": [200, 200, 200, 200],
+  "texts": ["e2e-ok", "e2e-ok", "e2e-ok", "e2e-ok"],
+  "account_routes": ["account-a", "account-b", "account-a", "account-b"],
+  "finish_records": [
+    { "totalSteps": 1, "steps": 1 },
+    { "totalSteps": 1, "steps": 1 },
+    { "totalSteps": 1, "steps": 1 },
+    { "totalSteps": 1, "steps": 1 }
+  ],
+  "sessions_released_on_sigterm": 2,
+  "real_tokens_used": false
+}

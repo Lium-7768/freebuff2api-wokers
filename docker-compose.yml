@@ -11,11 +11,8 @@ services:
       - HOST=0.0.0.0
       # 上游地址：默认空=直连官方 www.codebuff.com
       - CODEBUFF_API=
-      - RELAY_KEY=${RELAY_KEY}
-      - FREEBUFF_API_KEY=${FREEBUFF_API_KEY}
+      - FREEBUFF_API_KEY=${FREEBUFF_API_KEY:?FREEBUFF_API_KEY is required}
+      - FREEBUFF_TOKEN=${FREEBUFF_TOKEN:-}
       - FREEBUFF_DEBUG=false
-      # 可选：fetch 只请求广告，不伪造 impression；默认 fetch
-      - FREEBUFF_ADS_MODE=${FREEBUFF_ADS_MODE:-fetch}
-      - FREEBUFF_CLI_VERSION=${FREEBUFF_CLI_VERSION:-0.0.149}
     volumes:
       - ./credentials:/app/credentials:ro

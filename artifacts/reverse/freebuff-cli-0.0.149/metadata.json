@@ -1,0 +1,23 @@
+{
+  "sample": {
+    "name": "freebuff",
+    "version": "0.0.149",
+    "format": "Mach-O 64-bit arm64",
+    "runtime": "Bun single-file executable",
+    "size_bytes": 90294626,
+    "sha256": "fecf6ec876666cc0f60578d0ebcf4bb320e090335fbadc0bec0aebd0780e5a85"
+  },
+  "npm": {
+    "package": "freebuff@0.0.149",
+    "published_at": "2026-08-13T07:53:13.324Z",
+    "tarball_shasum": "b5d2ef451526a45761a8e4c5e163f2b985196788",
+    "repository": "git+https://github.com/CodebuffAI/freebuff-private.git",
+    "note": "The npm package is a launcher; the matching private source commit is not available."
+  },
+  "public_snapshot": {
+    "commit": "d46862b4b2ebf69a1b37e5c5daf9aa37052a61a0",
+    "committed_at": "2026-08-14T14:47:39Z",
+    "title": "Sync public snapshot from freebuff-private",
+    "caveat": "The snapshot is about 31 hours newer than the 0.0.149 package and cannot be claimed as its exact source commit."
+  }
+}
