@@ -281,7 +281,10 @@ function poolRetryAfterMs(pool, sessionModel) {
 // waiting_room_queued as stale sessions: those states must not delete a live
 // session or burn another session slot.
 const SESSION_GATE_CODES = {
-  waiting_room_required: { status: 428, endsSession: true },
+  // 428 means admission is required, not that the active session ended.
+  // Keep the cached owner evidence so a subsequent request can retry the
+  // same session instead of mistaking it for an external process.
+  waiting_room_required: { status: 428, endsSession: false },
   session_expired: { status: 410, endsSession: true },
   session_superseded: { status: 409, endsSession: true },
   session_model_mismatch: { status: 409, endsSession: true },
@@ -383,13 +386,29 @@ function invalidateSessionCache(token) {
   }
 }
 
+function isSessionOwnedByToken(token, instanceId) {
+  if (!instanceId) return false;
+  const prefix = token + ":";
+  for (const [key, session] of sessCache) {
+    if (key.startsWith(prefix) && session?.instanceId === instanceId) return true;
+  }
+  return false;
+}
+
 async function deleteUpstreamSession(token, instanceId) {
-  invalidateSessionCache(token);
-  if (!instanceId) return;
+  if (!instanceId) return false;
   try {
-    await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
+    const result = await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
       { "x-freebuff-instance-id": instanceId }, SESSION_TIMEOUT_MS);
+    // Keep owner evidence if DELETE failed or the upstream did not confirm
+    // cleanup. This prevents the next GET(active) from being misclassified as
+    // an external process after a transient control-plane failure.
+    if ((result.status >= 200 && result.status < 300) || result.status === 404) {
+      invalidateSessionCache(token);
+      return true;
+    }
   } catch {}
+  return false;
 }
 
 // VPS 进程退出时只释放本进程缓存中明确持有的 session。不会扫描或删除
@@ -600,12 +619,12 @@ class SessionOwnedElsewhereError extends Error {
 async function createSession(token, sessionModel, forceCreate = false, signal) {
   // 只复用本进程仍然有效的同一模型 session；不伪造广告、设备或使用轨迹。
   // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
+  const cacheKey = token + ":" + sessionModel;
+  const cached = sessCache.get(cacheKey);
   if (!forceCreate) {
-    const cached = sessCache.get(token + ":" + sessionModel);
     if (isUsableSession(cached)) {
       return cached;
     }
-    if (cached) sessCache.delete(token + ":" + sessionModel);
   }
   // 1) 查上游当前 session，同模型直接复用（forceCreate 时跳过：僵尸 active session 会被 GET 反复复用，
   //    导致 chat 一直 428；强制 POST 拿全新实例）。GET 使用 CLI 的普通请求形态。
@@ -619,8 +638,7 @@ async function createSession(token, sessionModel, forceCreate = false, signal) {
       accessTier: cur.data?.accessTier || null,
     });
     if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
-      const ownedByThisProcess = [...sessCache.values()]
-        .some((session) => session.instanceId === cur.data.instanceId);
+      const ownedByThisProcess = isSessionOwnedByToken(token, cur.data.instanceId);
       if (!ownedByThisProcess) {
         // 缓存未命中且 instanceId 不属于本进程，说明 session 由官方 CLI
         // 或另一 VPS 进程持有。不复用、不删除、不 takeover。
@@ -628,11 +646,20 @@ async function createSession(token, sessionModel, forceCreate = false, signal) {
       }
       if (!cur.data.model || cur.data.model === sessionModel) {
         const s = normalizeSession(cur.data, sessionModel);
-        sessCache.set(token + ":" + sessionModel, s);
-        return s;
+        if (isUsableSession(s)) {
+          sessCache.set(cacheKey, s);
+          return s;
+        }
+        // 上游仍报告本进程创建的临期 session 为 active。先安全释放，
+        // 再创建新 session；不能提前删除缓存，否则会丢失所有权证据。
+        await deleteUpstreamSession(token, cur.data.instanceId);
+      } else {
+        // 同一进程主动切换模型时可以安全释放自己持有的旧 session。
+        await deleteUpstreamSession(token, cur.data.instanceId);
       }
-      // 同一进程主动切换模型时可以安全释放自己持有的旧 session。
-      await deleteUpstreamSession(token, cur.data.instanceId);
+    } else {
+      // 上游已无 active session，清除本进程针对该账号的陈旧缓存。
+      invalidateSessionCache(token);
     }
   }
 
@@ -648,7 +675,7 @@ async function createSession(token, sessionModel, forceCreate = false, signal) {
   });
   if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
     const s = normalizeSession(r.data, sessionModel);
-    sessCache.set(token + ":" + sessionModel, s);
+    sessCache.set(cacheKey, s);
     return s;
   }
   if (r.status === 200 && r.data?.status === "queued" && r.data?.instanceId) {
@@ -664,7 +691,7 @@ async function createSession(token, sessionModel, forceCreate = false, signal) {
       });
       if (q.status === 200 && q.data?.status === "active") {
         const s = normalizeSession({ ...q.data, instanceId: q.data.instanceId || inst }, sessionModel);
-        sessCache.set(token + ":" + sessionModel, s);
+        sessCache.set(cacheKey, s);
         return s;
       }
     }
@@ -685,7 +712,7 @@ async function startRun(token, agentId, ancestors = [], signal) {
   return r.data.runId;
 }
 
-async function finishRun(token, chain, status, errorMessage) {
+async function finishRun(token, chain, status, errorMessage, signal) {
   await enqueueUp("POST", "/api/v1/agent-runs", token,
     {
       action: "FINISH",
@@ -696,7 +723,7 @@ async function finishRun(token, chain, status, errorMessage) {
       totalCredits: 0,
       ...(errorMessage ? { errorMessage: String(errorMessage).slice(0, 5000) } : {}),
       steps: chain.steps,
-    }, undefined, SESSION_TIMEOUT_MS);
+    }, undefined, SESSION_TIMEOUT_MS, signal);
 }
 
 async function startRunChain(token, agentId, signal) {
@@ -724,9 +751,9 @@ function completeRunStep(chain, step, messageId = null) {
   });
 }
 
-async function finishRunChain(token, chain, status, errorMessage) {
+async function finishRunChain(token, chain, status, errorMessage, signal) {
   if (!chain) return;
-  if (chain.runId) await finishRun(token, chain, status, errorMessage).catch(() => {});
+  if (chain.runId) await finishRun(token, chain, status, errorMessage, signal).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,7 +1095,11 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
       const finishCurrentRun = async (status, errorMessage) => {
         if (runFinalized || !run) return;
         runFinalized = true;
-        await finishRunChain(token, run, status, errorMessage);
+        // FINISH must survive an ordinary downstream disconnect so the run
+        // ledger records cancellation. The VPS runtime supplies a separate
+        // process-level signal that only aborts FINISH during shutdown,
+        // unblocking the shared queue before closeOwnedSessions sends DELETE.
+        await finishRunChain(token, run, status, errorMessage, env.SHUTDOWN_SIGNAL);
       };
 
       try {
@@ -1119,7 +1150,12 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
           await finishCurrentRun("failed", gateCode || errText);
 
           if (gateCode) {
-            if (SESSION_GATE_CODES[gateCode].endsSession) {
+            if (gateCode === "session_model_mismatch" && sess?.instanceId) {
+              // The instance was proven to be ours before the chat call. A
+              // model mismatch is not proof that it ended, so release that
+              // known owner explicitly; failed DELETE keeps the evidence.
+              await deleteUpstreamSession(token, sess.instanceId);
+            } else if (SESSION_GATE_CODES[gateCode].endsSession) {
               sessCache.delete(token + ":" + mc.session);
             }
             if (gateCode === "session_superseded") supersededTokens.add(token);
@@ -1183,7 +1219,8 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
         const statusMatch = msg.match(/\b(?:failed|error|upstream error:)\s*:?\s*(4\d{2}|5\d{2})\b/i);
         if (statusMatch) lastStatus = Number(statusMatch[1]);
         if (error instanceof QuotaExhaustedError) {
-          sessCache.delete(token + ":" + mc.session);
+          // Quota exhaustion is not proof that the upstream session ended;
+          // retain owner evidence so a later GET(active) cannot look foreign.
           cooldown(token, mc.session, error.retryAfterMs || 5 * 60 * 1000);
         } else if (error instanceof EmptyUpstreamStreamError) {
           // No evidence that an empty response makes the session stale: keep it
@@ -1359,6 +1396,17 @@ function anthropicStream(mc) {
         const raw = line.slice(5).trim();
         if (raw === "[DONE]") { end(ctl); continue; }
         let obj; try { obj = JSON.parse(raw); } catch { continue; }
+        if (obj?.error) {
+          ended = true;
+          events(ctl, "error", {
+            type: "error",
+            error: {
+              type: obj.error.type || "api_error",
+              message: obj.error.message || String(obj.error),
+            },
+          });
+          continue;
+        }
         if (obj.usage) { input = obj.usage.prompt_tokens ?? input; output = obj.usage.completion_tokens ?? output; }
         const choice = obj.choices?.[0]; if (!choice) continue;
         const delta = choice.delta || {};
@@ -1411,6 +1459,21 @@ class UpstreamProtocolError extends Error {
   }
 }
 
+function throwForUpstreamSseError(obj) {
+  if (!obj || typeof obj !== "object") return;
+  const error = obj.error ?? obj.data?.error;
+  if (error === undefined || error === null) return;
+  const code = typeof error === "object" && error.code ? String(error.code) : "";
+  const message = typeof error === "string"
+    ? error
+    : (error.message || (() => {
+        try { return JSON.stringify(error); } catch { return String(error); }
+      })());
+  throw new UpstreamProtocolError(
+    `upstream SSE error${code ? ` (${code})` : ""}: ${String(message).slice(0, 5000)}`,
+  );
+}
+
 function parseSseBlock(block) {
   const dataLines = [];
   for (const rawLine of block.split(/\r?\n/)) {
@@ -1437,8 +1500,11 @@ async function* readUpstreamSse(body) {
     sawData = true;
     if (payload === "[DONE]") return { done: true, obj: null };
     try {
-      return { done: false, obj: unwrapData(JSON.parse(payload)) };
+      const obj = unwrapData(JSON.parse(payload));
+      throwForUpstreamSseError(obj);
+      return { done: false, obj };
     } catch (error) {
+      if (error instanceof UpstreamProtocolError) throw error;
       throw new UpstreamProtocolError(`invalid upstream SSE JSON: ${String(error?.message || error)}`);
     }
   };

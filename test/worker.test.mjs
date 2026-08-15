@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { after, beforeEach, test } from 'node:test';
 
-import worker from '../worker.js';
+import worker, { closeOwnedSessions } from '../worker.js';
 
 const originalFetch = globalThis.fetch;
 const API_KEY = 'test-api-key';
@@ -47,7 +47,14 @@ function sse(content = 'ok') {
   );
 }
 
-function mockUpstream({ onChat, onSessionPost, calls }) {
+function sseError(message = 'upstream overloaded') {
+  return new Response([
+    `data: ${JSON.stringify({ error: { message, type: 'server_error', code: 'overloaded' } })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+}
+
+function mockUpstream({ onChat, onSessionGet, onSessionPost, onSessionDelete, calls }) {
   let runNumber = 0;
   globalThis.fetch = async (url, init = {}) => {
     const parsed = new URL(String(url));
@@ -63,7 +70,7 @@ function mockUpstream({ onChat, onSessionPost, calls }) {
 
     if (parsed.pathname === '/api/v1/usage') return Response.json({ ok: true });
     if (parsed.pathname === '/api/v1/freebuff/session' && call.method === 'GET') {
-      return Response.json({ status: 'ended' }, { status: 200 });
+      return Response.json(onSessionGet ? onSessionGet(call) : { status: 'ended' }, { status: 200 });
     }
     if (parsed.pathname === '/api/v1/freebuff/session' && call.method === 'POST') {
       return Response.json(onSessionPost ? onSessionPost(call) : {
@@ -74,7 +81,8 @@ function mockUpstream({ onChat, onSessionPost, calls }) {
       });
     }
     if (parsed.pathname === '/api/v1/freebuff/session' && call.method === 'DELETE') {
-      return Response.json({ ok: true });
+      const result = onSessionDelete ? onSessionDelete(call) : { ok: true };
+      return result instanceof Response ? result : Response.json(result);
     }
     if (parsed.pathname === '/api/v1/agent-runs' && body?.action === 'START') {
       runNumber += 1;
@@ -187,6 +195,194 @@ test('normal chat uses one base3 root and records an accurate completed finish',
   const chat = calls.find((call) => call.path === '/api/v1/chat/completions');
   assert.equal(chat.body.codebuff_metadata.llm_step_number, '1');
   assert.match(chat.body.messages[0].content, /^You are Buffy, the coding agent behind Codebuff\./);
+});
+
+test('an owned session below the reuse window is deleted and recreated', async () => {
+  const calls = [];
+  const token = `token-expiring-${tokenCounter}-aaaaaaaa`;
+  let currentSession = null;
+  let sessionNumber = 0;
+  mockUpstream({
+    calls,
+    onSessionGet: () => currentSession || { status: 'ended' },
+    onSessionPost: () => {
+      sessionNumber += 1;
+      currentSession = {
+        status: 'active',
+        instanceId: `expiring-instance-${sessionNumber}`,
+        model: 'deepseek/deepseek-v4-flash',
+        remainingMs: sessionNumber === 1 ? 30_000 : 3_600_000,
+      };
+      return currentSession;
+    },
+    onSessionDelete: (call) => {
+      assert.equal(call.signal.aborted, false);
+      assert.equal(currentSession.instanceId, 'expiring-instance-1');
+      currentSession = null;
+      return { ok: true };
+    },
+  });
+
+  const first = await worker.fetch(request('/v1/chat/completions', chatBody()), env([token]));
+  const second = await worker.fetch(request('/v1/chat/completions', chatBody()), env([token]));
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(calls.filter((call) => call.path === '/api/v1/freebuff/session' && call.method === 'POST').length, 2);
+  assert.equal(calls.filter((call) => call.path === '/api/v1/freebuff/session' && call.method === 'DELETE').length, 1);
+  assert.equal(calls.filter((call) => call.path === '/api/v1/chat/completions').length, 2);
+});
+
+test('a failed session DELETE retains owner evidence for a later cleanup retry', async () => {
+  const calls = [];
+  const token = `token-delete-retry-${tokenCounter}-aaaaaaaa`;
+  let deleteAttempts = 0;
+  mockUpstream({
+    calls,
+    onSessionPost: () => ({
+      status: 'active',
+      instanceId: 'delete-retry-instance',
+      model: 'deepseek/deepseek-v4-flash',
+      remainingMs: 3_600_000,
+    }),
+    onSessionDelete: (call) => {
+      if (call.auth === `Bearer ${token}`) deleteAttempts += 1;
+      return Response.json({ error: 'temporary failure' }, { status: 500 });
+    },
+  });
+
+  const response = await worker.fetch(request('/v1/chat/completions', chatBody()), env([token]));
+  assert.equal(response.status, 200);
+  await closeOwnedSessions();
+  await closeOwnedSessions();
+  assert.equal(deleteAttempts, 2);
+});
+
+test('waiting_room_required preserves ownership for a subsequent retry', async () => {
+  const calls = [];
+  const token = `token-waiting-owner-${tokenCounter}-aaaaaaaa`;
+  let currentSession = null;
+  let chatCount = 0;
+  mockUpstream({
+    calls,
+    onSessionGet: () => currentSession || { status: 'ended' },
+    onSessionPost: () => {
+      currentSession = {
+        status: 'active',
+        instanceId: 'waiting-owner-instance',
+        model: 'deepseek/deepseek-v4-flash',
+        remainingMs: 3_600_000,
+      };
+      return currentSession;
+    },
+    onChat: () => {
+      chatCount += 1;
+      return chatCount === 1
+        ? Response.json({ error: 'waiting_room_required', message: 'try again' }, { status: 428 })
+        : sse('recovered');
+    },
+  });
+
+  const first = await worker.fetch(request('/v1/chat/completions', chatBody()), env([token]));
+  const second = await worker.fetch(request('/v1/chat/completions', chatBody()), env([token]));
+
+  assert.equal(first.status, 428);
+  assert.equal(second.status, 200);
+  assert.equal(calls.filter((call) => call.path === '/api/v1/freebuff/session' && call.method === 'POST').length, 1);
+  assert.equal(calls.filter((call) => call.path === '/api/v1/freebuff/session' && call.method === 'DELETE').length, 0);
+  assert.equal(calls.filter((call) => call.path === '/api/v1/chat/completions').length, 2);
+});
+
+test('top-level SSE errors fail non-stream Chat and Responses runs', async () => {
+  const calls = [];
+  mockUpstream({ calls, onChat: () => sseError() });
+
+  const chat = await worker.fetch(
+    request('/v1/chat/completions', chatBody()),
+    env([`token-sse-error-chat-${tokenCounter}-aaaaaaaa`]),
+  );
+  const responses = await worker.fetch(
+    request('/v1/responses', {
+      model: 'deepseek/deepseek-v4-flash',
+      input: 'test',
+      stream: false,
+    }),
+    env([`token-sse-error-responses-${tokenCounter}-aaaaaaaa`]),
+  );
+
+  assert.equal(chat.status, 502);
+  assert.equal(responses.status, 502);
+  const finishes = calls.filter((call) => call.path === '/api/v1/agent-runs' && call.body?.action === 'FINISH');
+  assert.equal(finishes.length, 2);
+  assert.ok(finishes.every((finish) => finish.body.status === 'failed'));
+  assert.ok(finishes.every((finish) => /upstream SSE error/.test(finish.body.errorMessage)));
+});
+
+test('top-level SSE errors terminate streaming Chat and Responses as failures', async () => {
+  const calls = [];
+  mockUpstream({ calls, onChat: () => sseError('stream failed') });
+
+  const chat = await worker.fetch(
+    request('/v1/chat/completions', chatBody(undefined, { stream: true })),
+    env([`token-sse-stream-chat-${tokenCounter}-aaaaaaaa`]),
+  );
+  const chatText = await chat.text();
+  const responses = await worker.fetch(
+    request('/v1/responses', {
+      model: 'deepseek/deepseek-v4-flash',
+      input: 'test',
+      stream: true,
+    }),
+    env([`token-sse-stream-responses-${tokenCounter}-aaaaaaaa`]),
+  );
+  const responsesText = await responses.text();
+
+  assert.equal(chat.status, 200);
+  assert.match(chatText, /"type":"upstream_protocol_error"/);
+  assert.match(chatText, /data: \[DONE\]/);
+  assert.equal(responses.status, 200);
+  assert.match(responsesText, /"type":"response\.failed"/);
+  assert.doesNotMatch(responsesText, /"type":"response\.completed"/);
+  const finishes = calls.filter((call) => call.path === '/api/v1/agent-runs' && call.body?.action === 'FINISH');
+  assert.equal(finishes.length, 2);
+  assert.ok(finishes.every((finish) => finish.body.status === 'failed'));
+});
+
+test('top-level SSE errors become Anthropic error events', async () => {
+  const calls = [];
+  mockUpstream({ calls, onChat: () => sseError('anthropic stream failed') });
+  const response = await worker.fetch(new Request('http://local.test/v1/messages', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek/deepseek-v4-flash',
+      max_tokens: 64,
+      stream: true,
+      messages: [{ role: 'user', content: 'test' }],
+    }),
+  }), env([`token-sse-anthropic-${tokenCounter}-aaaaaaaa`]));
+  const text = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(text, /event: error/);
+  assert.match(text, /anthropic stream failed/);
+  assert.doesNotMatch(text, /event: message_stop/);
+  const finish = calls.find((call) => call.path === '/api/v1/agent-runs' && call.body?.action === 'FINISH');
+  assert.equal(finish.body.status, 'failed');
+});
+
+test('session_model_mismatch releases the proven owner instead of forgetting it', async () => {
+  const calls = [];
+  mockUpstream({
+    calls,
+    onChat: () => Response.json({ error: 'session_model_mismatch', message: 'wrong model' }, { status: 409 }),
+  });
+  const token = `token-model-mismatch-${tokenCounter}-aaaaaaaa`;
+  const response = await worker.fetch(request('/v1/chat/completions', chatBody()), env([token]));
+  assert.equal(response.status, 409);
+  const deletes = calls.filter((call) => call.path === '/api/v1/freebuff/session' && call.method === 'DELETE');
+  assert.equal(deletes.length, 1);
+  assert.equal(deletes[0].auth, `Bearer ${token}`);
 });
 
 for (const gate of [
@@ -367,6 +563,8 @@ test('downstream abort reaches the upstream chat fetch', async () => {
   const response = await pending;
   assert.equal(response.status, 499);
   assert.equal(observedAbort, true);
+  const finish = calls.find((call) => call.path === '/api/v1/agent-runs' && call.body?.action === 'FINISH');
+  assert.equal(finish.body.status, 'cancelled');
 });
 
 test('non-stream chat reconstructs fragmented tool calls', async () => {

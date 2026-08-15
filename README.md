@@ -155,6 +155,14 @@ codex exec --profile freebuff "只回复：连接成功"
 | `PORT` | 否 | `8787` | 监听端口 |
 | `CODEBUFF_API` | 否 | `https://www.codebuff.com` | 上游地址 |
 | `FREEBUFF_DEBUG` | 否 | `false` | 输出脱敏路由日志 |
+| `SHUTDOWN_GRACE_MS` | 否 | `5000` | SIGINT/SIGTERM 等待活动 HTTP 请求的毫秒数；可设为 `0` |
+| `SHUTDOWN_CLEANUP_TIMEOUT_MS` | 否 | `5000` | 退出时等待 session DELETE 的毫秒数；可设为 `0` |
+
+### VPS 部署边界
+
+- 建议以单个 Node 进程运行；内存中的 session owner、轮询游标和冷却状态不在多进程间共享。
+- `server.js` 提供 HTTP，公网部署应在前面使用 Caddy/Nginx 等反向代理负责 TLS 和访问控制。
+- `SIGTERM` 会触发活动请求取消、FINISH 收尾和自有 session 清理；编排器的终止宽限期应大于 `SHUTDOWN_CLEANUP_TIMEOUT_MS`。
 
 ## 测试和审计
 

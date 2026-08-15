@@ -48,6 +48,8 @@ const env = {
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
   CODEBUFF_API: process.env.CODEBUFF_API || '',
 };
+const shutdownSignalController = new AbortController();
+env.SHUTDOWN_SIGNAL = shutdownSignalController.signal;
 
 console.log(`[server] start: ${tokenLines.length} tokens, apiKeyConfigured=true, debug=${env.FREEBUFF_DEBUG}`);
 if (env.CODEBUFF_API) console.log(`[server] CODEBUFF_API=${env.CODEBUFF_API}`);
@@ -55,9 +57,25 @@ if (env.CODEBUFF_API) console.log(`[server] CODEBUFF_API=${env.CODEBUFF_API}`);
 // === HTTP server ===
 const port = parseInt(process.env.PORT || '8787', 10);
 const host = process.env.HOST || '0.0.0.0';
+function nonNegativeEnvMs(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+const shutdownGraceMs = nonNegativeEnvMs('SHUTDOWN_GRACE_MS', 5000);
+const shutdownCleanupMs = nonNegativeEnvMs('SHUTDOWN_CLEANUP_TIMEOUT_MS', 5000);
+const activeRequests = new Set();
+let shuttingDown = false;
 
 const server = createServer(async (nodeReq, nodeRes) => {
+  if (shuttingDown) {
+    nodeRes.writeHead(503, { 'content-type': 'application/json', connection: 'close' });
+    nodeRes.end(JSON.stringify({ error: { message: 'server shutting down', type: 'server_shutdown' } }));
+    return;
+  }
   const abortController = new AbortController();
+  activeRequests.add(abortController);
   const abortRequest = () => {
     if (!abortController.signal.aborted) {
       abortController.abort(new Error('downstream client disconnected'));
@@ -114,6 +132,7 @@ const server = createServer(async (nodeReq, nodeRes) => {
       nodeRes.end();
     }
   } finally {
+    activeRequests.delete(abortController);
     nodeReq.off('aborted', abortRequest);
     nodeRes.off('close', abortOnResponseClose);
   }
@@ -123,16 +142,45 @@ server.listen(port, host, () => {
   console.log(`[server] listening on ${host}:${port}`);
 });
 
-let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[server] ${signal}: shutting down`);
-  await new Promise((resolveClose) => server.close(resolveClose));
+  shutdownSignalController.abort(new Error(`${signal}: server shutting down`));
+
+  for (const controller of activeRequests) {
+    if (!controller.signal.aborted) controller.abort(new Error(`${signal}: server shutting down`));
+  }
+
+  let closeTimer;
+  const serverClosed = new Promise((resolveClose) => server.close(resolveClose));
+  const closeTimedOut = await Promise.race([
+    serverClosed.then(() => false),
+    new Promise((resolveTimeout) => {
+      closeTimer = setTimeout(() => resolveTimeout(true), shutdownGraceMs);
+    }),
+  ]);
+  clearTimeout(closeTimer);
+  if (closeTimedOut) {
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
+  }
+
+  let cleanupTimer;
   try {
-    await closeOwnedSessions();
+    await Promise.race([
+      closeOwnedSessions(),
+      new Promise((_, reject) => {
+        cleanupTimer = setTimeout(
+          () => reject(new Error(`session cleanup timed out after ${shutdownCleanupMs}ms`)),
+          shutdownCleanupMs,
+        );
+      }),
+    ]);
   } catch (error) {
     console.error(`[server] session cleanup failed: ${error.message}`);
+  } finally {
+    clearTimeout(cleanupTimer);
   }
   process.exit(0);
 }
