@@ -4,11 +4,10 @@ services:
     image: freebuff2api:local
     container_name: freebuff2api
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:8877:8787"
+    network_mode: host
     environment:
-      - PORT=8787
-      - HOST=0.0.0.0
+      - PORT=8877
+      - HOST=127.0.0.1
       # 上游地址：默认空=直连官方 www.codebuff.com
       - CODEBUFF_API=
       - FREEBUFF_API_KEY=${FREEBUFF_API_KEY:?FREEBUFF_API_KEY is required}

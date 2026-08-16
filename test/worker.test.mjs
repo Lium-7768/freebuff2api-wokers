@@ -24,12 +24,13 @@ function env(tokens = [`token-test-${tokenCounter}-aaaaaaaa`]) {
   };
 }
 
-function request(path, body, signal, apiKey = API_KEY) {
+function request(path, body, signal, apiKey = API_KEY, extraHeaders = {}) {
   return new Request(`http://local.test${path}`, {
     method: body === undefined ? 'GET' : 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
       ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      ...extraHeaders,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
@@ -412,6 +413,18 @@ test('session_model_mismatch releases the proven owner instead of forgetting it'
   assert.equal(deletes[0].auth, `Bearer ${token}`);
 });
 
+test('retries no_endpoints_found with one session rebuild', async () => {
+  const calls = [];
+  let attempts = 0;
+  mockUpstream({ calls, onChat: () => ++attempts === 1
+    ? Response.json({ error: 'no_endpoints_found', message: 'No endpoints found' }, { status: 404 })
+    : sse('recovered') });
+  const r = await worker.fetch(request('/v1/chat/completions', chatBody()), env());
+  assert.equal(r.status, 200);
+  assert.equal(attempts, 2);
+  assert.equal(calls.filter((x) => x.path === '/api/v1/freebuff/session' && x.method === 'POST').length, 2);
+  assert.equal(calls.filter((x) => x.path === '/api/v1/freebuff/session' && x.method === 'DELETE').length, 1);
+});
 for (const gate of [
   { code: 'session_superseded', status: 409 },
   { code: 'waiting_room_queued', status: 429 },
@@ -614,6 +627,119 @@ test('non-stream chat reconstructs fragmented tool calls', async () => {
     type: 'function',
     function: { name: 'read_file', arguments: '{"path":"README.md"}' },
   }]);
+});
+
+test('Harness mode aliases its generic tools to the native Freebuff tool names', async () => {
+  const calls = [];
+  mockUpstream({
+    calls,
+    onChat: (call) => {
+      assert.deepEqual(call.body.tools.map((tool) => tool.function.name), [
+        'run_terminal_command', 'read_files', 'write_file', 'str_replace', 'write_todos',
+      ]);
+      assert.equal(call.body.messages[2].tool_calls[0].function.name, 'run_terminal_command');
+      return new Response([
+        `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'native-call', type: 'function', function: { name: 'run_terminal_command', arguments: '{"command":"pwd"}' } }] }, finish_reason: 'tool_calls' }] })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join(''), { headers: { 'Content-Type': 'text/event-stream' } });
+    },
+  });
+  const response = await worker.fetch(request('/v1/chat/completions', chatBody(undefined, {
+    tools: [
+      { type: 'function', function: { name: 'bash', description: 'run', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'read', description: 'read', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'write', description: 'write', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'edit', description: 'edit', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'todo_write', description: 'todo', parameters: { type: 'object' } } },
+    ],
+    messages: [
+      { role: 'user', content: 'run a command' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'old-call', type: 'function', function: { name: 'bash', arguments: '{"command":"pwd"}' } }] },
+      { role: 'tool', tool_call_id: 'old-call', content: '/workspace' },
+    ],
+  }), undefined, API_KEY, { 'x-deepseek-harness-user-id': 'harness-user' }), env());
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.equal(body.choices[0].message.tool_calls[0].function.name, 'bash');
+});
+
+test('Harness model aliases resolve to the canonical Freebuff model', async () => {
+  const calls = [];
+  mockUpstream({ calls });
+  const response = await worker.fetch(request('/v1/chat/completions', chatBody('deepseek-v4-flash')), env());
+  assert.equal(response.status, 200);
+  const chat = calls.find((call) => call.path === '/api/v1/chat/completions');
+  assert.equal(chat.body.model, 'deepseek/deepseek-v4-flash');
+});
+
+test('Harness thinking mode is forwarded to the Freebuff chat request', async () => {
+  const calls = [];
+  mockUpstream({ calls });
+  const response = await worker.fetch(request('/v1/chat/completions', chatBody('deepseek-v4-flash', {
+    thinking: { type: 'enabled' },
+    stream_options: { include_usage: true },
+  })), env());
+  assert.equal(response.status, 200);
+  const chat = calls.find((call) => call.path === '/api/v1/chat/completions');
+  assert.deepEqual(chat.body.thinking, { type: 'enabled' });
+  assert.deepEqual(chat.body.stream_options, { include_usage: true });
+});
+
+test('Harness tool aliases are opt-in for non-Harness clients', async () => {
+  const calls = [];
+  mockUpstream({
+    calls,
+    onChat: (call) => {
+      assert.equal(call.body.tools[0].function.name, 'bash');
+      return sse('plain');
+    },
+  });
+  const response = await worker.fetch(request('/v1/chat/completions', chatBody(undefined, {
+    tools: [{ type: 'function', function: { name: 'bash', description: 'run', parameters: { type: 'object' } } }],
+  })), env());
+  assert.equal(response.status, 200);
+});
+
+test('Harness Chat tool turns reuse one native run across the session header', async () => {
+  const calls = [];
+  let chatCount = 0;
+  mockUpstream({
+    calls,
+    onChat: () => {
+      chatCount += 1;
+      if (chatCount === 1) {
+        return new Response([
+          `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'native-call', type: 'function', function: { name: 'run_terminal_command', arguments: '{"command":"pwd"}' } }] }, finish_reason: 'tool_calls' }] })}\n\n`,
+          'data: [DONE]\n\n',
+        ].join(''), { headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      return sse('done');
+    },
+  });
+  const headers = { 'x-deepseek-harness-session-id': 'harness-session-1' };
+  const first = await worker.fetch(request('/v1/chat/completions', chatBody(undefined, {
+    tools: [{ type: 'function', function: { name: 'bash', description: 'run', parameters: { type: 'object' } } }],
+  }), undefined, API_KEY, headers), env());
+  assert.equal(first.status, 200);
+  const firstBody = await first.json();
+  assert.equal(firstBody.choices[0].message.tool_calls[0].function.name, 'bash');
+
+  const second = await worker.fetch(request('/v1/chat/completions', chatBody(undefined, {
+    tools: [{ type: 'function', function: { name: 'bash', description: 'run', parameters: { type: 'object' } } }],
+    messages: [
+      { role: 'user', content: 'run a command' },
+      firstBody.choices[0].message,
+      { role: 'tool', tool_call_id: 'native-call', content: '/workspace' },
+    ],
+  }), undefined, API_KEY, headers), env());
+  assert.equal(second.status, 200);
+  const starts = calls.filter((call) => call.path === '/api/v1/agent-runs' && call.body?.action === 'START');
+  const finishes = calls.filter((call) => call.path === '/api/v1/agent-runs' && call.body?.action === 'FINISH');
+  assert.equal(starts.length, 1);
+  assert.equal(finishes.length, 1);
+  assert.equal(finishes[0].body.totalSteps, 2);
+  assert.equal(finishes[0].body.steps.length, 2);
 });
 
 test('Responses function_call history keeps the assistant call before its tool output', async () => {

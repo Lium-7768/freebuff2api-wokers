@@ -99,6 +99,95 @@ const supersededTokens = new Set(); // 官方语义：本进程一旦被 superse
 // execute tools; retaining the run id here lets a Responses client continue
 // that same run without giving the adapter a local tool runtime.
 const responseTraceCache = new Map(); // response id -> { traceSessionId, runId, token, model, instanceId, totalSteps, steps, active, checkedAt }
+// Harness drives Chat Completions as a multi-step loop.  Keep the native run
+// open between tool-call and tool-result requests when it supplies a stable
+// session id; this is intentionally separate from Responses' response-id
+// cache and expires with ordinary in-memory cache cleanup.
+const harnessRunCache = new Map(); // `${sessionId}:${model}` -> { token, instanceId, run, checkedAt }
+
+// Freebuff's base3 endpoint only advertises the native CLI tool names.  The
+// DeepSeek Harness uses a deliberately generic tool catalog (bash/read/write
+// ...).  In opt-in harness mode we translate only the names, preserving the
+// caller's schemas and arguments; responses are translated back before they
+// leave this adapter.  The default path remains byte-for-byte compatible with
+// existing OpenAI/Anthropic clients.
+const HARNESS_TOOL_ALIASES = {
+  bash: "run_terminal_command",
+  read: "read_files",
+  write: "write_file",
+  edit: "str_replace",
+  todo_write: "write_todos",
+  glob: "list_directory",
+  grep: "code_search",
+  web_fetch: "read_url",
+  ask_user_question: "ask_user",
+  subagent: "suggest_followups",
+};
+
+function harnessToolMode(env) {
+  return String(env?.FREEBUFF_CLIENT_BEHAVIOR || "").toLowerCase() === "harness";
+}
+
+function toolAliasFor(name, aliases = HARNESS_TOOL_ALIASES) {
+  return aliases[name] || name;
+}
+
+function invertToolAliases(aliases = HARNESS_TOOL_ALIASES) {
+  const inverse = new Map();
+  for (const [clientName, upstreamName] of Object.entries(aliases)) {
+    // Do not create an ambiguous reverse mapping.  A duplicate would make it
+    // impossible to deterministically restore a streamed tool call.
+    if (!inverse.has(upstreamName)) inverse.set(upstreamName, clientName);
+  }
+  return inverse;
+}
+
+function mapToolMessages(messages, aliases = HARNESS_TOOL_ALIASES) {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map((message) => {
+    if (!message || typeof message !== "object") return message;
+    if (!Array.isArray(message.tool_calls)) return message;
+    return {
+      ...message,
+      tool_calls: message.tool_calls.map((call) => ({
+        ...call,
+        function: call.function && typeof call.function === "object"
+          ? { ...call.function, name: toolAliasFor(call.function.name, aliases) }
+          : call.function,
+      })),
+    };
+  });
+}
+
+function mapClientTools(params, enabled) {
+  if (!enabled || !Array.isArray(params?.tools)) return params;
+  const aliases = HARNESS_TOOL_ALIASES;
+  const seen = new Set();
+  const tools = [];
+  for (const tool of params.tools) {
+    if (!tool || typeof tool !== "object") continue;
+    // Chat and Harness both use the OpenAI function wrapper here. Responses
+    // flattening is completed before executeChat() receives these params.
+    const fn = tool.type === "function" && tool.function && typeof tool.function === "object"
+      ? tool.function
+      : tool;
+    const clientName = fn.name || "";
+    const upstreamName = toolAliasFor(clientName, aliases);
+    if (!clientName || seen.has(upstreamName)) continue;
+    seen.add(upstreamName);
+    if (tool.type === "function" && tool.function) {
+      tools.push({ ...tool, function: { ...tool.function, name: upstreamName } });
+    } else {
+      tools.push({ ...tool, name: upstreamName });
+    }
+  }
+  let toolChoice = params.tool_choice;
+  if (typeof toolChoice === "string") toolChoice = toolAliasFor(toolChoice, aliases);
+  else if (toolChoice && typeof toolChoice === "object" && toolChoice.function && typeof toolChoice.function === "object") {
+    toolChoice = { ...toolChoice, function: { ...toolChoice.function, name: toolAliasFor(toolChoice.function.name, aliases) } };
+  }
+  return { ...params, tools, tool_choice: toolChoice, messages: mapToolMessages(params.messages, aliases) };
+}
 
 
 function parseAccounts(env) {
@@ -127,6 +216,42 @@ function parseAccounts(env) {
 const acctHealth = new Map(); // token -> { alive, state, uid, quota, checkedAt }
 const HEALTH_OBSERVATION_TTL_MS = 10 * 60 * 1000;
 
+// 固定公开快照的 cli/src/utils/freebuff-session-api.ts 明确解码的 session
+// admission 响应。状态、HTTP code 与方法须同时匹配；这不是对未知状态的推断。
+const DOCUMENTED_SESSION_ADMISSION_STATES = {
+  banned: { status: 403, methods: new Set(["GET", "POST"]) },
+  country_blocked: { status: 403, methods: new Set(["GET", "POST"]) },
+  model_locked: { status: 409, methods: new Set(["POST"]) },
+  model_unavailable: { status: 409, methods: new Set(["POST"]) },
+  rate_limited: { status: 429, methods: new Set(["POST"]) },
+  spend_limited: { status: 429, methods: new Set(["POST"]) },
+  ip_capped: { status: 429, methods: new Set(["POST"]) },
+};
+
+function documentedSessionAdmissionState(method, status, data) {
+  const state = data && typeof data === "object" ? data.status : null;
+  const rule = typeof state === "string" ? DOCUMENTED_SESSION_ADMISSION_STATES[state] : null;
+  return rule && rule.status === status && rule.methods.has(method) ? state : null;
+}
+
+function documentedSessionRetryAfterMs(data) {
+  const retryAfterMs = data && typeof data === "object" ? Number(data.retryAfterMs) : NaN;
+  return Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : null;
+}
+
+class SessionAdmissionError extends Error {
+  constructor(method, status, state, data) {
+    const detail = data && typeof data === "object"
+      ? String(data.message || data.availableHours || data.requestedModel || "").slice(0, 300)
+      : "";
+    super("freebuff session " + method + " admission " + state + (detail ? ": " + detail : ""));
+    this.name = "SessionAdmissionError";
+    this.status = status;
+    this.state = state;
+    this.retryAfterMs = documentedSessionRetryAfterMs(data);
+  }
+}
+
 // 只记录真实业务请求已经观察到的上游结果。不要在 healthz 中主动探测，
 // 也不要把网络错误/未知响应误记成账号失效。
 function recordAccountObservation(token, status, dataOrText, extra = {}) {
@@ -137,8 +262,9 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
   }
   const upstreamState = data && typeof data === "object" ? data.status || data.state : null;
   let state = null;
+  const documented = documentedSessionAdmissionState("POST", status, data) || documentedSessionAdmissionState("GET", status, data);
   if (status === 404) state = "ok";
-  else if (["banned", "country_blocked", "rate_limited", "model_locked", "ip_capped"].includes(upstreamState)) state = upstreamState;
+  else if (documented) state = documented;
   else if (status >= 200 && status < 300) state = "ok";
   else if (status === 401) state = "token_invalid";
   else if (status === 403) {
@@ -319,6 +445,19 @@ function shouldRotateAccount(status) {
 }
 
 // 仅供流式无首数据时确认 Premium 额度是否耗尽；不参与账号轮询排序。
+function isEndpointUnavailableError(status, text) {
+  // 仅兼容已观察到的上游瞬时分配失败，普通 404 仍原样返回。
+  if (status !== 404) return false;
+  const raw = String(text || '');
+  try {
+    const parsed = JSON.parse(raw);
+    const code = typeof parsed?.error === 'string' ? parsed.error : parsed?.error?.code;
+    const message = parsed?.message || parsed?.error?.message || '';
+    return code === 'no_endpoints_found' || /no endpoints found/i.test(String(message));
+  } catch {
+    return /no endpoints found/i.test(raw);
+  }
+}
 function remainingQuota(token, sessionModel) {
   if (modelPoolCategory(sessionModel) === "standard") return null;
   const h = acctHealth.get(token);
@@ -425,6 +564,13 @@ async function deleteUpstreamSession(token, instanceId) {
 // VPS 进程退出时只释放本进程缓存中明确持有的 session。不会扫描或删除
 // 其他客户端的活跃 session。
 export async function closeOwnedSessions() {
+  const openHarnessRuns = [...harnessRunCache.values()];
+  harnessRunCache.clear();
+  for (const context of openHarnessRuns) {
+    if (context?.run && context.token) {
+      await finishRunChain(context.token, context.run, "cancelled", "process shutdown");
+    }
+  }
   const owned = [];
   const seen = new Set();
   for (const [key, session] of sessCache) {
@@ -730,6 +876,10 @@ async function createSession(token, sessionModel, forceCreate = false, signal, e
       retryAfterMs: cur.data?.retryAfterMs,
       accessTier: cur.data?.accessTier || null,
     });
+    const currentAdmissionState = documentedSessionAdmissionState("GET", cur.status, cur.data);
+    if (currentAdmissionState) {
+      throw new SessionAdmissionError("GET", cur.status, currentAdmissionState, cur.data);
+    }
     if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
       const ownedByThisProcess = isSessionOwnedByToken(token, cur.data.instanceId);
       if (!ownedByThisProcess) {
@@ -766,6 +916,10 @@ async function createSession(token, sessionModel, forceCreate = false, signal, e
     retryAfterMs: r.data?.retryAfterMs,
     accessTier: r.data?.accessTier || null,
   });
+  const admissionState = documentedSessionAdmissionState("POST", r.status, r.data);
+  if (admissionState) {
+    throw new SessionAdmissionError("POST", r.status, admissionState, r.data);
+  }
   if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
     const s = normalizeSession(r.data, sessionModel);
     sessCache.set(cacheKey, s);
@@ -856,7 +1010,7 @@ async function finishRunChain(token, chain, status, errorMessage, signal) {
 const UPSTREAM_KEYS = [
   "frequency_penalty", "logit_bias", "logprobs", "max_completion_tokens", "max_tokens",
   "metadata", "modalities", "parallel_tool_calls", "presence_penalty", "reasoning_effort",
-  "response_format", "seed", "service_tier", "stop", "store", "stream_options",
+  "response_format", "seed", "service_tier", "stop", "store", "stream_options", "thinking",
   "temperature", "tool_choice", "tools", "top_logprobs", "top_p", "top_k", "user",
 ];
 
@@ -995,15 +1149,16 @@ function rememberResponseTrace(responseId, traceSessionId, continuation = {}) {
   responseTraceCache.set(responseId, { traceSessionId, ...continuation, checkedAt: Date.now() });
 }
 
-function buildUpstreamPayload(params, mc, sess, runId, clientSessionId, traceSessionId, llmStepNumber) {
+function buildUpstreamPayload(params, mc, sess, runId, clientSessionId, traceSessionId, llmStepNumber, harnessMode = false) {
+  const sourceParams = mapClientTools(params, harnessMode);
   const payload = {};
-  for (const k of UPSTREAM_KEYS) if (params[k] !== undefined && params[k] !== null) payload[k] = params[k];
+  for (const k of UPSTREAM_KEYS) if (sourceParams[k] !== undefined && sourceParams[k] !== null) payload[k] = sourceParams[k];
   // reasoning_effort 按官方模型 efforts 表 clamp-down（不拒绝、不换模型）
   if (payload.reasoning_effort !== undefined) {
     payload.reasoning_effort = normalizeReasoningEffort(mc.id, payload.reasoning_effort);
   }
   payload.model = mc.upstream;
-  payload.messages = normalizeMessages(params.messages);
+  payload.messages = normalizeMessages(sourceParams.messages);
   payload.stream = true;
   if (!payload.stop) payload.stop = ['"cb_easp"'];
   payload.provider = { data_collection: "deny" };
@@ -1026,8 +1181,14 @@ function buildUpstreamPayload(params, mc, sess, runId, clientSessionId, traceSes
 
 // Only the ordinary CLI picker catalog is advertised and accepted. Account-
 // specific limited offers cannot be proven without creating/refreshing a session.
+const MODEL_ALIASES = new Map([
+  ["deepseek-v4-flash", "deepseek/deepseek-v4-flash"],
+  ["deepseek-v4-pro", "deepseek/deepseek-v4-pro"],
+]);
+
 function findModelConfig(modelId) {
-  return MODELS.find((model) => model.id === modelId) || null;
+  const canonical = MODEL_ALIASES.get(modelId) || modelId;
+  return MODELS.find((model) => model.id === canonical) || null;
 }
 
 async function resolveModelConfig(modelId) {
@@ -1037,6 +1198,15 @@ async function resolveModelConfig(modelId) {
 async function handleChat(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
+  // Harness emits this stable attribution header on every LLM request.  Use
+  // it as an opt-in compatibility signal so deployments do not need a second
+  // client-specific URL or environment toggle.  The explicit environment
+  // switch remains available for clients that omit the header.
+  if (request.headers.has("x-deepseek-harness-user-id") || request.headers.has("x-deepseek-harness-session-id")) {
+    params.__harness_mode = true;
+  }
+  const harnessSessionId = request.headers.get("x-deepseek-harness-session-id");
+  if (harnessSessionId) params.__harness_session_id = harnessSessionId;
   const isStream = !!params.stream;
   const requestedModel = params.model || DEFAULT_MODEL;
   const mc = await resolveModelConfig(requestedModel);
@@ -1049,6 +1219,11 @@ async function handleResponses(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
   const isStream = !!params.stream;
+  if (request.headers.has("x-deepseek-harness-user-id") || request.headers.has("x-deepseek-harness-session-id")) {
+    params.__harness_mode = true;
+  }
+  const harnessSessionId = request.headers.get("x-deepseek-harness-session-id");
+  if (harnessSessionId) params.__harness_session_id = harnessSessionId;
   const requestedModel = params.model || DEFAULT_MODEL;
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
@@ -1058,7 +1233,7 @@ async function handleResponses(request, env) {
 // Responses API 请求 → chat completions 参数（字段名/结构翻译）
 function responsesToChatParams(params, mc) {
   const chat = {};
-  for (const k of ["temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls", "stop", "seed", "store", "metadata", "user", "stream"]) {
+  for (const k of ["temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls", "stop", "seed", "store", "metadata", "user", "stream", "thinking", "stream_options"]) {
     if (params[k] !== undefined && params[k] !== null) chat[k] = params[k];
   }
   if (params.max_output_tokens !== undefined && params.max_output_tokens !== null) chat.max_completion_tokens = params.max_output_tokens;
@@ -1092,6 +1267,8 @@ function responsesToChatParams(params, mc) {
   }
   chat.model = mc.id;
   chat.messages = responsesInputToMessages(params.input, params.instructions);
+  if (params.__harness_mode) chat.__harness_mode = true;
+  if (params.__harness_session_id) chat.__harness_session_id = params.__harness_session_id;
   if (params.previous_response_id) chat.__previous_response_id = params.previous_response_id;
   return chat;
 }
@@ -1152,6 +1329,11 @@ function responsesInputToMessages(input, instructions) {
 // session gate 按官方 error+status wire contract 原样终止，不自动抢 session 或换号。
 async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSignal) {
   const debug = env.FREEBUFF_DEBUG === "true";
+  const harnessMode = harnessToolMode(env) || chatParams?.__harness_mode === true;
+  const reverseToolAliases = harnessMode ? invertToolAliases() : null;
+  const harnessSessionId = harnessMode && typeof chatParams?.__harness_session_id === "string"
+    ? chatParams.__harness_session_id.trim() : "";
+  const harnessRunKey = harnessSessionId ? `${harnessSessionId}:${mc.session}` : null;
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
 
@@ -1170,15 +1352,28 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
   const previousTrace = mode === "responses" ? traceContextFor(previousResponseId) : null;
   const traceSessionId = traceSessionFor(previousResponseId);
   const attemptedTokens = new Set();
-
+  const endpointRecoveryTokens = new Set();
+  const recreateSessionTokens = new Set();
   try {
-    for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-      const acct = pickToken(env, mc.session, attemptedTokens, previousTrace?.active ? previousTrace.token : null);
+    // no_endpoints_found 只允许每个账号触发一次同账号重建。
+    for (let acctTry = 0; acctTry < pool.length * 2; acctTry++) {
+      const cachedHarnessRun = harnessRunKey ? harnessRunCache.get(harnessRunKey) : null;
+      const recoveryToken = recreateSessionTokens.values().next().value || null;
+      if (recoveryToken) attemptedTokens.delete(recoveryToken);
+      const acct = pickToken(
+        env,
+        mc.session,
+        attemptedTokens,
+        recoveryToken || (previousTrace?.active ? previousTrace.token : cachedHarnessRun?.token || null),
+      );
       const token = acct ? acct.token : null;
       if (!token) break;
+      const forceSessionRecreate = token === recoveryToken;
+      if (forceSessionRecreate) recreateSessionTokens.delete(token);
       attemptedTokens.add(token);
       logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
-        isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
+        forceSessionRecreate ? 'endpoint_recovery' :
+          (isUsableSession(sessCache.get(token + ':' + mc.session)) ? 'active_session' : 'quota_or_round_robin'));
 
       let run = null;
       let step = null;
@@ -1192,6 +1387,10 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
       const finishCurrentRun = async (status, errorMessage) => {
         if (runFinalized || !run) return;
         runFinalized = true;
+        if (harnessRunKey) {
+          const cached = harnessRunCache.get(harnessRunKey);
+          if (cached?.run === run) harnessRunCache.delete(harnessRunKey);
+        }
         // FINISH must survive an ordinary downstream disconnect so the run
         // ledger records cancellation. The VPS runtime supplies a separate
         // process-level signal that only aborts FINISH during shutdown,
@@ -1200,7 +1399,7 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
       };
 
       try {
-        const sess = await createSession(token, mc.session, false, requestAbortSignal, env);
+        const sess = await createSession(token, mc.session, forceSessionRecreate, requestAbortSignal, env);
         if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
 
         // A Responses tool continuation reuses the same agent run and ledger
@@ -1215,6 +1414,9 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
             totalSteps: Number.isInteger(previousTrace.totalSteps) ? previousTrace.totalSteps : 0,
             steps: Array.isArray(previousTrace.steps) ? previousTrace.steps.map((item) => ({ ...item })) : [],
           };
+        } else if (harnessRunKey && cachedHarnessRun?.token === token && cachedHarnessRun.instanceId === sess.instanceId && cachedHarnessRun.run?.runId) {
+          run = cachedHarnessRun.run;
+          cachedHarnessRun.checkedAt = Date.now();
         } else {
           run = await startRunChain(token, mc.agent, requestAbortSignal);
         }
@@ -1229,6 +1431,7 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
           clientSessionId,
           traceSessionId,
           step.stepNumber,
+          harnessMode,
         );
         const headers = {
           Authorization: "Bearer " + token,
@@ -1277,6 +1480,20 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
           }
 
           lastErrMsg = "upstream error: " + errText.slice(0, 300);
+          if (isEndpointUnavailableError(resp.status, errText)) {
+            // 适配器可用性扩展：不把普通 404 当作可重试错误。
+            if (!endpointRecoveryTokens.has(token) && await deleteUpstreamSession(token, sess.instanceId)) {
+              endpointRecoveryTokens.add(token);
+              recreateSessionTokens.add(token);
+              attemptedTokens.delete(token);
+              if (debug) console.log(`[acct ${acctTry + 1}] no endpoints found, rebuild session once`);
+              continue;
+            }
+            cooldown(token, mc.session, 2_000);
+            lastStatus = 503;
+            if (debug) console.log(`[acct ${acctTry + 1}] no endpoints found, switch account`);
+            continue;
+          }
           if (!shouldRotateAccount(resp.status)) {
             return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, resp.status);
           }
@@ -1290,7 +1507,10 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
           const aborted = requestAbortSignal?.aborted;
           const status = aborted ? "cancelled" : streamError ? "failed" : "completed";
           if (status === "completed") completeCurrentStep();
-          const hasContinuation = mode === "responses" && status === "completed" && streamInfo.hasToolCalls;
+          const hasContinuation = status === "completed" && streamInfo.hasToolCalls && (mode === "responses" || Boolean(harnessRunKey));
+          if (hasContinuation && harnessRunKey) {
+            harnessRunCache.set(harnessRunKey, { token, instanceId: sess.instanceId, run, checkedAt: Date.now() });
+          }
           if (mode === "responses" && streamInfo.responseId) {
             rememberResponseTrace(streamInfo.responseId, traceSessionId, {
               token,
@@ -1319,8 +1539,9 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
             previousResponseId,
             traceSessionId,
             { token, model: mc.session, instanceId: sess.instanceId, runId: run.runId, totalSteps: run.totalSteps, steps: run.steps },
+            reverseToolAliases,
           );
-          else pipeUpstreamToClient(resp.body, writable, finalizeStream);
+          else pipeUpstreamToClient(resp.body, writable, finalizeStream, reverseToolAliases);
           return new Response(readable, {
             status: 200,
             headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
@@ -1328,12 +1549,16 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
         }
 
         const result = mode === "responses"
-          ? await responsesToNonStream(resp.body, mc, previousResponseId)
-          : await streamToNonStream(resp.body, mc.upstream);
+          ? await responsesToNonStream(resp.body, mc, previousResponseId, reverseToolAliases)
+          : await streamToNonStream(resp.body, mc.upstream, reverseToolAliases);
         completeCurrentStep();
         const hasContinuation = mode === "responses"
-          && Array.isArray(result.output)
-          && result.output.some((item) => item && item.type === "function_call");
+          ? Array.isArray(result.output) && result.output.some((item) => item && item.type === "function_call")
+          : Boolean(harnessRunKey) && Array.isArray(result.choices?.[0]?.message?.tool_calls)
+            && result.choices[0].message.tool_calls.length > 0;
+        if (hasContinuation && harnessRunKey) {
+          harnessRunCache.set(harnessRunKey, { token, instanceId: sess.instanceId, run, checkedAt: Date.now() });
+        }
         if (mode === "responses") {
           rememberResponseTrace(result.id, traceSessionId, {
             token,
@@ -1363,7 +1588,12 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
         }
         const statusMatch = msg.match(/\b(?:failed|error|upstream error:)\s*:?\s*(4\d{2}|5\d{2})\b/i);
         if (statusMatch) lastStatus = Number(statusMatch[1]);
-        if (error instanceof QuotaExhaustedError) {
+        if (error instanceof SessionAdmissionError) {
+          lastStatus = error.status;
+          // 仅对公开快照明示的 429 retryAfterMs 应用模型级冷却；不删除 session，
+          // 也不回退模型或猜测未知等待时间。
+          if (error.status === 429 && error.retryAfterMs) cooldown(token, mc.session, error.retryAfterMs);
+        } else if (error instanceof QuotaExhaustedError) {
           // Quota exhaustion is not proof that the upstream session ended;
           // retain owner evidence so a later GET(active) cannot look foreign.
           cooldown(token, mc.session, error.retryAfterMs || 5 * 60 * 1000);
@@ -1693,16 +1923,19 @@ function mergeToolCall(toolCalls, tc) {
   if (fn.arguments) item.arguments += fn.arguments;
 }
 
-function openAiToolCalls(toolCalls) {
+function openAiToolCalls(toolCalls, reverseToolAliases = null) {
   return [...toolCalls.values()].map((item) => ({
     id: item.id || `call_${Math.random().toString(36).slice(2, 10)}`,
     type: item.type || "function",
-    function: { name: item.name, arguments: item.arguments },
+    function: {
+      name: reverseToolAliases?.get(item.name) || item.name,
+      arguments: item.arguments,
+    },
   }));
 }
 
 // 流式：把上游 SSE 剥 {data:...} 包装后透传
-function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
+function pipeUpstreamToClient(upstreamBody, writable, onComplete, reverseToolAliases = null) {
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   (async () => {
@@ -1720,7 +1953,16 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
         const choice = event.obj?.choices?.[0];
         if (choice?.finish_reason) sawFinish = true;
         if (Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length) hasToolCalls = true;
-        await writer.write(encoder.encode("data: " + JSON.stringify(event.obj) + "\n\n"));
+        const output = event.obj;
+        if (reverseToolAliases && Array.isArray(output?.choices?.[0]?.delta?.tool_calls)) {
+          output.choices[0].delta.tool_calls = output.choices[0].delta.tool_calls.map((call) => ({
+            ...call,
+            function: call.function && typeof call.function === "object"
+              ? { ...call.function, name: reverseToolAliases.get(call.function.name) || call.function.name }
+              : call.function,
+          }));
+        }
+        await writer.write(encoder.encode("data: " + JSON.stringify(output) + "\n\n"));
       }
       if (!sawDone && !sawFinish) throw new UpstreamProtocolError("upstream SSE ended before finish_reason or [DONE]");
       if (!sawDone) await writer.write(encoder.encode("data: [DONE]\n\n"));
@@ -1739,7 +1981,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
 }
 
 // 非流式：聚合上游流成 OpenAI 非流式对象
-async function streamToNonStream(upstreamBody, upstreamModel) {
+async function streamToNonStream(upstreamBody, upstreamModel, reverseToolAliases = null) {
   let content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
   let sawDone = false;
   const toolCalls = new Map();
@@ -1760,7 +2002,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
     if (choice.finish_reason) finishReason = choice.finish_reason;
   }
   if (!sawDone && !finishReason) throw new UpstreamProtocolError("upstream SSE ended before finish_reason or [DONE]");
-  const mergedToolCalls = openAiToolCalls(toolCalls);
+  const mergedToolCalls = openAiToolCalls(toolCalls, reverseToolAliases);
   const msg = { role: "assistant", content: mergedToolCalls.length && !content ? null : content };
   if (mergedToolCalls.length) msg.tool_calls = mergedToolCalls;
   if (reasoning && !content) { msg.content = reasoning; msg.reasoning_used_as_content = true; }
@@ -1846,6 +2088,7 @@ async function pipeUpstreamToResponsesStream(
   previousResponseId = null,
   traceSessionId = null,
   continuation = {},
+  reverseToolAliases = null,
 ) {
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -1880,7 +2123,7 @@ async function pipeUpstreamToResponsesStream(
       id: "fc_" + Math.random().toString(36).slice(2, 10),
       outputIndex: nextOutputIndex++,
       callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
-      name: fn.name || "",
+      name: reverseToolAliases?.get(fn.name) || fn.name || "",
       args: "",
     };
     items.push(item);
@@ -1916,7 +2159,10 @@ async function pipeUpstreamToResponsesStream(
             }
             const fn = tc.function || {};
             if (tc.id) item.callId = tc.id;
-            if (fn.name && item.name !== fn.name) item.name += fn.name;
+            if (fn.name) {
+              const clientName = reverseToolAliases?.get(fn.name) || fn.name;
+              if (item.name !== clientName) item.name += clientName;
+            }
             if (fn.arguments) {
               item.args += fn.arguments;
               await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: fn.arguments });
@@ -1994,7 +2240,7 @@ async function pipeUpstreamToResponsesStream(
 }
 
 // 非流式：聚合上游流成 Responses API 非流式对象
-async function responsesToNonStream(upstreamBody, mc, previousResponseId = null) {
+async function responsesToNonStream(upstreamBody, mc, previousResponseId = null, reverseToolAliases = null) {
   let model = "", outputText = "", reasoning = "", usage = null, finishReason = null, sawDone = false;
   const toolCalls = new Map();
   for await (const event of readUpstreamSse(upstreamBody)) {
@@ -2025,7 +2271,7 @@ async function responsesToNonStream(upstreamBody, mc, previousResponseId = null)
       content: [{ type: "output_text", text, annotations: [] }],
     });
   }
-  for (const item of openAiToolCalls(toolCalls)) {
+  for (const item of openAiToolCalls(toolCalls, reverseToolAliases)) {
     resp.output.push({
       id: "fc_" + Math.random().toString(36).slice(2, 10),
       type: "function_call",
@@ -2067,6 +2313,16 @@ function cleanCache() {
         const oldest = responseTraceCache.keys().next().value;
         if (oldest === undefined) break;
         responseTraceCache.delete(oldest);
+      }
+    }
+    for (const [key, context] of harnessRunCache) {
+      if (now - (context.checkedAt || 0) > 2 * 60 * 60 * 1000) harnessRunCache.delete(key);
+    }
+    if (harnessRunCache.size > 1000) {
+      while (harnessRunCache.size > 1000) {
+        const oldest = harnessRunCache.keys().next().value;
+        if (oldest === undefined) break;
+        harnessRunCache.delete(oldest);
       }
     }
   } catch {}

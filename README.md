@@ -145,6 +145,34 @@ export FREEBUFF_API_KEY='与服务端一致的访问密钥'
 codex exec --profile freebuff "只回复：连接成功"
 ```
 
+## DeepSeek Harness
+
+本适配器也可作为 `/Users/meiyu/code/deepseek/deepseek-harness` 的
+`@deepseek-ai/dsh-llm-deepseek` 宿主端点。Harness 使用 Chat Completions，
+而不是 Responses：
+
+```bash
+export DEEPSEEK_BASE_URL='https://你的域名/v1'
+export DEEPSEEK_API_KEY='VPS 上配置的 FREEBUFF_API_KEY'
+
+# Harness 默认使用无前缀模型名；适配器也接受这个别名。
+python - <<'PY'
+from deepseek_harness import DeepSeekHarness
+with DeepSeekHarness(provider="deepseek-official", model="deepseek-v4-flash") as harness:
+    print(harness.run("只回复：Harness连接成功").final_response)
+PY
+```
+
+Freebuff 的 base3 上游只接受 CLI 原生工具名。请求带有 Harness 的
+`x-deepseek-harness-user-id`/`x-deepseek-harness-session-id` 标头时，适配器
+会自动将 `bash/read/write/edit/todo_write` 等 Harness 工具名转换为原生名，
+再把返回的 tool call 名称转换回去。若客户端不发送这些标头，可在服务端显式
+设置 `FREEBUFF_CLIENT_BEHAVIOR=harness` 后重启服务。
+
+Harness 的本地工具仍由 Harness 执行；VPS 只负责上游 session、SSE 和工具调用
+协议转换。部署新代码后应先运行 Harness 的单步文本和一轮 `bash` 工具回归，
+再进行长时间多 step 任务。
+
 ## 环境变量
 
 | 变量 | 必需 | 默认值 | 说明 |
@@ -155,7 +183,7 @@ codex exec --profile freebuff "只回复：连接成功"
 | `PORT` | 否 | `8787` | 监听端口 |
 | `CODEBUFF_API` | 否 | `https://www.codebuff.com` | 上游地址 |
 | `FREEBUFF_DEBUG` | 否 | `false` | 输出脱敏路由日志 |
-| `FREEBUFF_CLIENT_BEHAVIOR` | 否 | `off` | 设为 `cli` 才启用 main 分支同款的节流 ads/usage 兼容请求；默认关闭 |
+| `FREEBUFF_CLIENT_BEHAVIOR` | 否 | `off` | `cli` 启用 main 分支 ads/usage 兼容；`harness` 启用 Harness 工具名/多 step 兼容；默认关闭 |
 | `FREEBUFF_FINGERPRINT_ID` | 否 | 自动派生 | `FREEBUFF_CLIENT_BEHAVIOR=cli` 时可提供你自己的稳定指纹 |
 | `SHUTDOWN_GRACE_MS` | 否 | `5000` | SIGINT/SIGTERM 等待活动 HTTP 请求的毫秒数；可设为 `0` |
 | `SHUTDOWN_CLEANUP_TIMEOUT_MS` | 否 | `5000` | 退出时等待 session DELETE 的毫秒数；可设为 `0` |
