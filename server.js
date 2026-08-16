@@ -12,6 +12,20 @@ const closeOwnedSessions = worker.closeOwnedSessions;
 
 // === Build env from config ===
 
+// Production may mount root-owned one-secret-per-file runtime secrets.  The
+// environment-variable and credentials-directory fallbacks remain for local
+// development only; no secret values are logged.
+const runtimeSecretsDir = String(process.env.FREEBUFF_SECRETS_DIR || '').trim();
+function readRuntimeSecret(name) {
+  if (!runtimeSecretsDir) return '';
+  try {
+    return readFileSync(resolve(runtimeSecretsDir, name), 'utf-8').trim();
+  } catch (err) {
+    if (err?.code !== 'ENOENT') console.error(`[server] cannot read runtime secret ${name}: ${err.message}`);
+    return '';
+  }
+}
+
 // Read tokens from credentials/ directory
 const credDir = resolve(__dirname, 'credentials');
 let tokenLines = [];
@@ -28,16 +42,17 @@ if (existsSync(credDir)) {
   }
 }
 
-// Also allow FREEBUFF_TOKEN env var for non-credential token sources
-const envToken = process.env.FREEBUFF_TOKEN || '';
-if (envToken) {
-  for (const tok of envToken.split(/[\n,]/)) {
+// Prefer runtime secret files in production.  Environment variables remain
+// a local-development fallback and are not required by the deployment path.
+const tokenSource = readRuntimeSecret('upstream_tokens') || process.env.FREEBUFF_TOKEN || '';
+if (tokenSource) {
+  for (const tok of tokenSource.split(/[\n,]/)) {
     const t = tok.trim();
     if (t && !tokenLines.includes(t)) tokenLines.push(t);
   }
 }
 
-const apiKey = String(process.env.FREEBUFF_API_KEY || '').trim();
+const apiKey = String(readRuntimeSecret('api_key') || process.env.FREEBUFF_API_KEY || '').trim();
 if (!apiKey) {
   throw new Error('FREEBUFF_API_KEY is required; refusing to start with a public default key');
 }
@@ -48,13 +63,13 @@ const env = {
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
   FREEBUFF_CLIENT_BEHAVIOR: process.env.FREEBUFF_CLIENT_BEHAVIOR || 'off',
   FREEBUFF_FINGERPRINT_ID: process.env.FREEBUFF_FINGERPRINT_ID || '',
-  CODEBUFF_API: process.env.CODEBUFF_API || '',
+  CODEBUFF_API: readRuntimeSecret('codebuff_api') || process.env.CODEBUFF_API || '',
 };
 const shutdownSignalController = new AbortController();
 env.SHUTDOWN_SIGNAL = shutdownSignalController.signal;
 
 console.log(`[server] start: ${tokenLines.length} tokens, apiKeyConfigured=true, debug=${env.FREEBUFF_DEBUG}`);
-if (env.CODEBUFF_API) console.log(`[server] CODEBUFF_API=${env.CODEBUFF_API}`);
+if (env.CODEBUFF_API) console.log('[server] CODEBUFF_API configured');
 
 // === HTTP server ===
 const port = parseInt(process.env.PORT || '8787', 10);

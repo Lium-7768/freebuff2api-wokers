@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Root-owned forced-command handler for the GitHub deployment key.
+# It never prints runtime secret values and accepts only the verbs below.
+set -euo pipefail
+
+readonly APP_NAME="freebuff2api"
+readonly SECRET_DIR="/run/freebuff2api"
+readonly CANDIDATE_PORT="8878"
+readonly PRODUCTION_PORT="8877"
+readonly ORIGINAL_COMMAND="${SSH_ORIGINAL_COMMAND:-}"
+
+fail() {
+  echo "deployment command rejected: $*" >&2
+  exit 64
+}
+
+ensure_secret_dir() {
+  install -d -m 0711 -o root -g root "$SECRET_DIR"
+}
+
+load_image() {
+  [[ "$ORIGINAL_COMMAND" == "load-image" ]] || fail "invalid load-image command"
+  gzip -dc | /usr/bin/docker load >/dev/null
+  echo "image loaded"
+}
+
+install_secrets() {
+  [[ "$ORIGINAL_COMMAND" == "install-secrets" ]] || fail "invalid install-secrets command"
+  local stage key value target seen_api=0 seen_tokens=0
+  stage="$(mktemp -d /run/freebuff2api-stage.XXXXXX)"
+  trap 'rm -rf "$stage"' RETURN
+  chmod 0711 "$stage"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == *=* ]] || fail "invalid secret record"
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      FREEBUFF_API_KEY) target="api_key"; seen_api=1 ;;
+      FREEBUFF_TOKEN) target="upstream_tokens"; seen_tokens=1 ;;
+      CODEBUFF_API) target="codebuff_api" ;;
+      *) fail "unknown secret name" ;;
+    esac
+    printf '%s' "$value" > "$stage/$target"
+    chown root:root "$stage/$target"
+    chmod 0400 "$stage/$target"
+  done
+
+  [[ "$seen_api" == 1 && "$seen_tokens" == 1 ]] || fail "required runtime secrets missing"
+  rm -rf "${SECRET_DIR}.previous"
+  if [[ -d "$SECRET_DIR" ]]; then mv "$SECRET_DIR" "${SECRET_DIR}.previous"; fi
+  mv "$stage" "$SECRET_DIR"
+  rm -rf "${SECRET_DIR}.previous"
+  trap - RETURN
+  echo "runtime secrets installed"
+}
+
+container_args() {
+  local name="$1" port="$2" image="$3"
+  /usr/bin/docker run -d --name "$name" --network host \
+    -e HOST=127.0.0.1 \
+    -e PORT="$port" \
+    -e FREEBUFF_SECRETS_DIR=/run/freebuff2api \
+    -v "$SECRET_DIR:/run/freebuff2api:ro" \
+    "$image"
+}
+
+wait_for_health() {
+  local port="$1" attempts=12
+  while (( attempts > 0 )); do
+    if /usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:${port}/healthz" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+    attempts=$((attempts - 1))
+  done
+  return 1
+}
+
+deploy_image() {
+  local image old_name="" candidate="${APP_NAME}-candidate"
+  [[ "$ORIGINAL_COMMAND" =~ ^deploy\ freebuff2api:[a-f0-9]{40}$ ]] || fail "invalid deploy image"
+  image="${ORIGINAL_COMMAND#deploy }"
+  /usr/bin/docker image inspect "$image" >/dev/null
+  [[ -f "$SECRET_DIR/api_key" && -f "$SECRET_DIR/upstream_tokens" ]] || fail "runtime secrets not installed"
+
+  /usr/bin/docker rm -f "$candidate" >/dev/null 2>&1 || true
+  container_args "$candidate" "$CANDIDATE_PORT" "$image" >/dev/null
+  if ! wait_for_health "$CANDIDATE_PORT"; then
+    /usr/bin/docker logs --tail 80 "$candidate" >&2 || true
+    /usr/bin/docker rm -f "$candidate" >/dev/null 2>&1 || true
+    fail "candidate health check failed"
+  fi
+  /usr/bin/docker rm -f "$candidate" >/dev/null
+
+  if /usr/bin/docker inspect "$APP_NAME" >/dev/null 2>&1; then
+    old_name="${APP_NAME}-rollback-$(date +%Y%m%d%H%M%S)"
+    /usr/bin/docker stop "$APP_NAME" >/dev/null
+    /usr/bin/docker rename "$APP_NAME" "$old_name"
+  fi
+
+  if ! container_args "$APP_NAME" "$PRODUCTION_PORT" "$image" >/dev/null || ! wait_for_health "$PRODUCTION_PORT"; then
+    /usr/bin/docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
+    if [[ -n "$old_name" ]]; then
+      /usr/bin/docker rename "$old_name" "$APP_NAME" || true
+      /usr/bin/docker start "$APP_NAME" || true
+    fi
+    fail "production health check failed; rollback attempted"
+  fi
+
+  /usr/bin/docker update --restart unless-stopped "$APP_NAME" >/dev/null
+  if [[ -n "$old_name" ]]; then /usr/bin/docker rm -f "$old_name" >/dev/null; fi
+  /usr/bin/docker image prune -f >/dev/null 2>&1 || true
+  echo "deployment healthy"
+}
+
+health() {
+  [[ "$ORIGINAL_COMMAND" == "health" ]] || fail "invalid health command"
+  /usr/bin/curl -fsS --max-time 3 "http://127.0.0.1:${PRODUCTION_PORT}/healthz"
+}
+
+case "$ORIGINAL_COMMAND" in
+  load-image) load_image ;;
+  install-secrets) install_secrets ;;
+  health) health ;;
+  deploy\ freebuff2api:*) deploy_image ;;
+  *) fail "unknown command" ;;
+esac

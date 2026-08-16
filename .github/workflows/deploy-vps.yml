@@ -1,0 +1,91 @@
+name: Deploy Freebuff adapter to VPS
+
+on:
+  push:
+    branches:
+      - codex/vps-protocol-compat
+  workflow_dispatch:
+
+concurrency:
+  group: freebuff2api-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Protocol regression tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the protected deployment revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Verify Node runtime
+        run: node --version
+      - name: Run protocol regression tests
+        run: node --test test/*.test.mjs
+
+  deploy:
+    name: Build and deploy
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Production
+    permissions:
+      contents: read
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      FREEBUFF_API_KEY: ${{ secrets.FREEBUFF_API_KEY }}
+      FREEBUFF_TOKEN: ${{ secrets.FREEBUFF_TOKEN }}
+      DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+      DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+    steps:
+      - name: Check out the tested revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Prepare the restricted SSH client
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > "$HOME/.ssh/freebuff2api_deploy"
+          chmod 600 "$HOME/.ssh/freebuff2api_deploy"
+          printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+      - name: Build the immutable release image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --tag "freebuff2api:${GITHUB_SHA}" .
+      - name: Load the release image on the VPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker save "freebuff2api:${GITHUB_SHA}" | gzip -1 | \
+            ssh -i "$HOME/.ssh/freebuff2api_deploy" \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              "$DEPLOY_USER@$DEPLOY_HOST" load-image
+      - name: Send runtime secrets over standard input
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'FREEBUFF_API_KEY=%s\n' "$FREEBUFF_API_KEY"
+            printf 'FREEBUFF_TOKEN=%s\n' "$FREEBUFF_TOKEN"
+          } | ssh -i "$HOME/.ssh/freebuff2api_deploy" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              "$DEPLOY_USER@$DEPLOY_HOST" install-secrets
+      - name: Switch after local candidate health check
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "$HOME/.ssh/freebuff2api_deploy" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" "deploy freebuff2api:${GITHUB_SHA}"
+      - name: Verify the production container health from the VPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "$HOME/.ssh/freebuff2api_deploy" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" health

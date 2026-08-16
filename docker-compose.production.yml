@@ -1,0 +1,15 @@
+# Production reference only. GitHub Actions deploys the same settings through
+# the restricted VPS command; this file contains no secrets.
+services:
+  freebuff2api:
+    image: ${IMAGE_REF:?set IMAGE_REF to an immutable freebuff2api image tag}
+    container_name: freebuff2api
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      HOST: 127.0.0.1
+      PORT: 8877
+      FREEBUFF_SECRETS_DIR: /run/freebuff2api
+      FREEBUFF_DEBUG: "false"
+    volumes:
+      - /run/freebuff2api:/run/freebuff2api:ro
