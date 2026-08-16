@@ -58,6 +58,9 @@ install_secrets() {
 container_args() {
   local name="$1" port="$2" image="$3"
   /usr/bin/docker run -d --name "$name" --network host \
+    --user 0:0 \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges \
     -e HOST=127.0.0.1 \
     -e PORT="$port" \
     -e FREEBUFF_SECRETS_DIR=/run/freebuff2api \

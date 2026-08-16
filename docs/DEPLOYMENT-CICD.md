@@ -28,6 +28,7 @@
 
 目录由 root 管理，部署账号没有交互 shell 且只能运行受限命令。容器把该目录只读挂载到 `/run/freebuff2api`，以 `FREEBUFF_SECRETS_DIR=/run/freebuff2api` 读取；不会把应用秘密写入镜像或 Git 工作树。
 
+为读取宿主机的 `0400 root:root` secrets 文件，服务进程在容器内以 UID 0 运行；启动参数同时删除全部 Linux capabilities 并启用 `no-new-privileges`，从而仅保留读取只读挂载所需的最小权限。
 `/run` 是临时文件系统。若 VPS 重启，服务不会带着旧 token 自动恢复，必须通过 GitHub Actions 再部署一次；这是本设计刻意避免在 VPS 上持久保存应用 secrets 的代价。
 
 ## 发布与回滚

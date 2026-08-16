@@ -6,6 +6,11 @@ services:
     container_name: freebuff2api
     restart: unless-stopped
     network_mode: host
+    user: "0:0"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges
     environment:
       HOST: 127.0.0.1
       PORT: 8877
