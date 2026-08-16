@@ -2,7 +2,7 @@
 
 运行在自有 VPS 上的 Freebuff OpenAI/Anthropic 兼容适配器。
 
-> 当前基线：Freebuff CLI `0.0.149`、base3、Node.js 单进程。项目不再以 Cloudflare Worker 或 Vercel 为运行目标。
+> 当前基线：Freebuff CLI `0.0.149`、base3、VPS Node.js 单进程。
 
 ## 给 AI 先看
 
@@ -70,20 +70,20 @@ A → B → C → A → B → C
 
 每个账号复用自己的 session。明确限流或临时错误才切换账号；session gate 原样返回，不跨账号抢 seat。
 
-也可以使用凭证目录：
+也可以使用传统凭证目录；该目录中的单账号文件只读取 `authToken`：
 
 ```text
 credentials/account-a.json
 credentials/account-b.json
 ```
 
-每个文件格式：
+若要直接使用官方 CLI 导出的 `{default:{...}}` 凭证容器，设置 `FREEBUFF_CREDENTIALS_JSON`。适配器只读取其中的 `authToken` 与 `fingerprintId`；`id`、`name`、`email`、`fingerprintHash` 不会加入聊天、session 或 agent-runs 请求：
 
-```json
-{"authToken":"..."}
+```bash
+export FREEBUFF_CREDENTIALS_JSON="$(cat credentials/default.json)"
 ```
 
-`credentials/` 已被 Git 忽略。
+其中 `fingerprintId` 仅用于 `/api/v1/usage` body；环境变量 `FREEBUFF_FINGERPRINT_ID` 若显式设置，会覆盖凭证中的该字段。
 
 ## Node/VPS 启动
 
@@ -178,13 +178,14 @@ Harness 的本地工具仍由 Harness 执行；VPS 只负责上游 session、SSE
 | 变量 | 必需 | 默认值 | 说明 |
 |---|---|---|---|
 | `FREEBUFF_API_KEY` | 是 | 无 | 本服务访问密钥 |
-| `FREEBUFF_TOKEN` | 二选一 | 无 | Freebuff token 列表 |
+| `FREEBUFF_TOKEN` | 否 | 无 | 传统 Freebuff token 列表；可与 `FREEBUFF_CREDENTIALS_JSON` 同时使用 |
+| `FREEBUFF_CREDENTIALS_JSON` | 否 | 无 | 官方 `{default:{authToken,fingerprintId,...}}` JSON；优先使用其中的 authToken 与 usage fingerprintId |
 | `HOST` | 否 | `0.0.0.0` | 监听地址 |
 | `PORT` | 否 | `8787` | 监听端口 |
+| `FREEBUFF_FINGERPRINT_ID` | 否 | `cli-usage` | `FREEBUFF_CLIENT_BEHAVIOR=cli` 时覆盖凭证中的 fingerprintId，仅用于 usage body |
 | `CODEBUFF_API` | 否 | `https://www.codebuff.com` | 上游地址 |
 | `FREEBUFF_DEBUG` | 否 | `false` | 输出脱敏路由日志 |
-| `FREEBUFF_CLIENT_BEHAVIOR` | 否 | `off` | `cli` 启用 main 分支 ads/usage 兼容；`harness` 启用 Harness 工具名/多 step 兼容；默认关闭 |
-| `FREEBUFF_FINGERPRINT_ID` | 否 | 自动派生 | `FREEBUFF_CLIENT_BEHAVIOR=cli` 时可提供你自己的稳定指纹 |
+| `FREEBUFF_CLIENT_BEHAVIOR` | 否 | `cli` | `cli` 按报告启用 ads/usage；`off` 显式关闭；`harness` 仅启用 Harness 工具名/多 step 兼容 |
 | `SHUTDOWN_GRACE_MS` | 否 | `5000` | SIGINT/SIGTERM 等待活动 HTTP 请求的毫秒数；可设为 `0` |
 | `SHUTDOWN_CLEANUP_TIMEOUT_MS` | 否 | `5000` | 退出时等待 session DELETE 的毫秒数；可设为 `0` |
 
@@ -207,10 +208,9 @@ npm run audit:protocol
 ## 架构边界
 
 本项目是协议适配器，不是完整 Freebuff CLI runtime：
-
+- 浏览器登录仍由 `freebuff_tools` 或官方 CLI 负责。服务端可接收官方 credentials JSON，但不执行浏览器登录或完整 credentials 管理；默认按报告发送 ads/usage；如需显式停用可设置 `FREEBUFF_CLIENT_BEHAVIOR=off`。`FREEBUFF_FINGERPRINT_ID` 仅用于 usage body，默认值为 `cli-usage`。
 - 不在 VPS 执行官方15个本地工具。
 - 支持 Responses `previous_response_id` 的客户端驱动多 step run 续接，但不在 VPS 执行官方15个本地工具；工具仍由 Codex/SDK 客户端执行。
-- 浏览器登录仍由 `freebuff_tools` 或官方 CLI 负责。服务端默认不发 ads/usage；如确需与 main 分支行为一致，可显式设置 `FREEBUFF_CLIENT_BEHAVIOR=cli`，并可用 `FREEBUFF_FINGERPRINT_ID` 指定稳定标识。
 - Codex 工具由 Codex 客户端执行，本服务负责正确传递 tool call/result。
 - 内存状态要求单 Node 实例运行。
 

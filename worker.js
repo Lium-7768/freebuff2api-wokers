@@ -1,10 +1,74 @@
 const DEFAULT_CODEBUFF_API = "https://www.codebuff.com";
 let configuredCodebuffApi = DEFAULT_CODEBUFF_API;
+// Freebuff CLI 0.0.149 wire constants. Keep these values centralized so the
+// adapter cannot silently drift between session, prompt, and compatibility
+// requests. fingerprintId is deliberately not a chat-wide header.
+const FREEBUFF_CLI_USER_AGENT = "ai-sdk/openai-compatible/0.0.149/codebuff";
+const FREEBUFF_MODEL_HEADER = "x-freebuff-model";
+const FREEBUFF_INSTANCE_HEADER = "x-freebuff-instance-id";
+const FREEBUFF_COMPACT_SESSION_HEADER = "x-freebuff-compact-session";
+const adSessionIds = new Map();
+function adSessionIdFor(token, env) {
+  if (env?.FREEBUFF_CHAT_SESSION_ID) return String(env.FREEBUFF_CHAT_SESSION_ID);
+  if (!adSessionIds.has(token)) adSessionIds.set(token, crypto.randomUUID());
+  return adSessionIds.get(token);
+}
+const adActivity = new Map();
+function adsBehaviorDue(token, context, env) {
+  const now = Date.now();
+  const messages = Array.isArray(context?.messages) ? context.messages : [];
+  const latestUser = [...messages].reverse().find((message) => message?.role === "user");
+  const activityKey = typeof latestUser?.content === "string" ? latestUser.content : "";
+  const state = adActivity.get(token) || { activityKey: "", lastFetch: 0, lastActivity: 0, fetches: 0 };
+  if (activityKey && activityKey !== state.activityKey) {
+    state.activityKey = activityKey;
+    state.lastActivity = now;
+    state.fetches = 0;
+  }
+  const force = String(env?.FREEBUFF_AD_FORCE_START || "false").toLowerCase() === "true";
+  if (!state.lastFetch) { if (!(force || activityKey)) { adActivity.set(token, state); return false; } }
+  else if (now - state.lastFetch < 60000 || now - state.lastActivity > 30000 || state.fetches >= 3) { adActivity.set(token, state); return false; }
+  state.lastFetch = now;
+  state.fetches += 1;
+  adActivity.set(token, state);
+  return true;
+}
+const FREEBUFF_ACTING_USER_HEADER = "x-freebuff-acting-user-id";
+
+function freebuffAuthHeaders(token, extra = {}) {
+  return {
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...extra,
+  };
+}
+
+function freebuffSessionModelHeaders(model) {
+  return { [FREEBUFF_MODEL_HEADER]: model };
+}
+
+function freebuffSessionInstanceHeaders(instanceId) {
+  return { [FREEBUFF_INSTANCE_HEADER]: instanceId };
+}
+function freebuffSessionGetHeaders(env, instanceId) {
+  const headers = instanceId ? freebuffSessionInstanceHeaders(instanceId) : {};
+  if (String(env?.FREEBUFF_COMPACT_SESSION || "false").toLowerCase() === "true") {
+    headers[FREEBUFF_COMPACT_SESSION_HEADER] = "1";
+  }
+  return headers;
+}
+
+function freebuffChatHeaders(token, instanceId) {
+  return freebuffAuthHeaders(token, {
+    "Content-Type": "application/json",
+    "User-Agent": FREEBUFF_CLI_USER_AGENT,
+    [FREEBUFF_INSTANCE_HEADER]: instanceId,
+  });
+}
 
 function codebuffApi() {
   return configuredCodebuffApi;
 }
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_MODEL = "deepseek/deepseek-v4-pro";
 const VERSION = "1.9.0";
 
 // Freebuff CLI 0.0.149 uses the base3 harness. Keep this catalog limited to the
@@ -189,24 +253,42 @@ function mapClientTools(params, enabled) {
   return { ...params, tools, tool_choice: toolChoice, messages: mapToolMessages(params.messages, aliases) };
 }
 
-
+function parseOfficialCredential(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    const credential = parsed?.default && typeof parsed.default === "object" ? parsed.default : parsed;
+    const token = typeof credential?.authToken === "string" ? credential.authToken.trim() : "";
+    if (token.length <= 8) return null;
+    return {
+      token,
+      uid: typeof credential.id === "string" && credential.id ? credential.id : null,
+      fingerprintId: typeof credential.fingerprintId === "string" && credential.fingerprintId ? credential.fingerprintId : null,
+    };
+  } catch {
+    return null;
+  }
+}
 function parseAccounts(env) {
-  // 支持一行一个（换行）或逗号分隔；每项可为纯 token 或 "token:uid"（冒号配对 user_id）
-  // 例："t1\nt2:u2\nt3,u4:u4" → [{token:t1,uid:null},{token:t2,uid:u2},...]
+  // FREEBUFF_CREDENTIALS_JSON accepts the official {default:{...}} credentials container.
+  // Only authToken and the usage-specific fingerprintId are protocol inputs.
   const seen = new Set();
-  return (env.FREEBUFF_TOKEN || "").split(/[\n,]/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 8)
-    .map((s) => {
-      const idx = s.indexOf(":");
-      if (idx > 0) return { token: s.slice(0, idx).trim(), uid: s.slice(idx + 1).trim() || null };
-      return { token: s, uid: null };
-    })
-    .filter((a) => {
-      if (a.token.length <= 8 || seen.has(a.token)) return false;
-      seen.add(a.token);
-      return true;
-    });
+  const accounts = [];
+  const credential = parseOfficialCredential(env.FREEBUFF_CREDENTIALS_JSON);
+  if (credential) accounts.push(credential);
+  for (const item of String(env.FREEBUFF_TOKEN || "").split(/[\n,]/)) {
+    const entry = item.trim();
+    if (entry.length <= 8) continue;
+    const idx = entry.indexOf(":");
+    accounts.push(idx > 0
+      ? { token: entry.slice(0, idx).trim(), uid: entry.slice(idx + 1).trim() || null, fingerprintId: null }
+      : { token: entry, uid: null, fingerprintId: null });
+  }
+  return accounts.filter((account) => {
+    if (account.token.length <= 8 || seen.has(account.token)) return false;
+    seen.add(account.token);
+    return true;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +631,7 @@ async function deleteUpstreamSession(token, instanceId) {
   if (!instanceId) return false;
   try {
     const result = await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
-      { "x-freebuff-instance-id": instanceId }, SESSION_TIMEOUT_MS);
+      undefined, SESSION_TIMEOUT_MS);
     // Keep owner evidence if DELETE failed or the upstream did not confirm
     // cleanup. This prevents the next GET(active) from being misclassified as
     // an external process after a transient control-plane failure.
@@ -788,74 +870,77 @@ function behaviorDue(key) {
   return true;
 }
 
-function stableFingerprint(token) {
-  let h1 = 0x811c9dc5;
-  let h2 = 0x01000193;
-  const input = `freebuff-fp-v2:${token}`;
-  for (let index = 0; index < input.length; index += 1) {
-    const code = input.charCodeAt(index);
-    h1 = Math.imul(h1 ^ code, 0x01000193) >>> 0;
-    h2 = Math.imul(h2 ^ code, 0x85ebca6b) >>> 0;
-  }
-  return `enhanced-${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}`;
-}
-
-async function runNormalClientBehavior(token, env, signal) {
-  if (String(env?.FREEBUFF_CLIENT_BEHAVIOR || "off").toLowerCase() !== "cli") return;
-  const fingerprintId = String(env.FREEBUFF_FINGERPRINT_ID || stableFingerprint(token));
-  const userAgent = "ai-sdk/openai-compatible/0.0.149/codebuff";
-
-  if (behaviorDue(`ads:${token}`)) {
+async function runNormalClientBehavior(token, env, signal, context = {}, account = null) {
+  if (String(env?.FREEBUFF_CLIENT_BEHAVIOR || "cli").toLowerCase() !== "cli") return;
+  const fingerprintId = String(env.FREEBUFF_FINGERPRINT_ID || account?.fingerprintId || "cli-usage");
+  const localeOptions = Intl.DateTimeFormat().resolvedOptions();
+  const device = { os: "linux", timezone: localeOptions.timeZone || "UTC", locale: localeOptions.locale || "en-US" };
+  const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+  const cliUserAgent = "Freebuff-CLI/0.0.149";
+  if (adsBehaviorDue(token, context, env)) {
     try {
-      const ad = await enqueueUp(
-        "POST",
-        "/api/v1/ads",
-        token,
-        {
-          provider: "gravity",
-          sessionId: crypto.randomUUID(),
-          surface: "waiting_room",
-          device: { os: "unknown", timezone: "UTC", locale: "en-US" },
-          userAgent,
-        },
-        { "User-Agent": userAgent },
-        6000,
-        signal,
-      );
-      const impUrl = ad.data?.ads?.[0]?.impUrl;
-      if (ad.status >= 200 && ad.status < 300 && impUrl) {
-        await enqueueUp(
-          "POST",
-          "/api/v1/ads/impression",
-          token,
-          { impUrl, mode: "free" },
-          { "User-Agent": userAgent },
-          6000,
-          signal,
-        );
+      const adPayload = {
+        provider: String(env.FREEBUFF_AD_PROVIDER || "gravity"),
+        messages: Array.isArray(context.messages) ? context.messages.filter((m) => ["user", "assistant"].includes(m?.role) && typeof m?.content === "string" && !m.content.includes("INSTRUCTIONS_PROMPT")).map(({ role, content }) => ({ role, content: content.trim() })).filter((m) => m.content) : [],
+        sessionId: adSessionIdFor(token, env),
+        device,
+        userAgent,
+      };
+      if (env.FREEBUFF_AD_SURFACE) adPayload.surface = String(env.FREEBUFF_AD_SURFACE);
+      if (env.FREEBUFF_AD_PLACEMENT_ID) adPayload.placementId = String(env.FREEBUFF_AD_PLACEMENT_ID);
+      const ad = await enqueueUp("POST", "/api/v1/ads", token, adPayload, { "User-Agent": cliUserAgent }, 6000, signal);
+      const ads = Array.isArray(ad.data?.ads) ? ad.data.ads : [];
+      for (const choice of ads) if (!choice.provider) choice.provider = String(env.FREEBUFF_AD_PROVIDER || "gravity");
+      if (ad.status >= 200 && ad.status < 300) {
+        for (const choice of ads) {
+          if (!choice?.impUrl) continue;
+          const impression = await enqueueUp("POST", "/api/v1/ads/impression", token,
+            { impUrl: choice.impUrl, mode: String(env.FREEBUFF_AGENT_MODE || "free") },
+            { "User-Agent": cliUserAgent }, 6000, signal);
+          if (impression.data && Object.hasOwn(impression.data, "creditsGranted")) {
+            choice.creditsGranted = impression.data.creditsGranted;
+          }
+        }
       }
-    } catch {}
+      await reportZeroClickImpressions(ads, signal);
+    } catch (error) {
+      if (env?.FREEBUFF_DEBUG === "true") console.debug("[ads] failed", String(error?.message || error));
+    }
   }
-
   if (behaviorDue(`usage:${token}`)) {
-    try {
-      await enqueueUp(
-        "POST",
-        "/api/v1/usage",
-        token,
-        { fingerprintId },
-        {},
-        6000,
-        signal,
-      );
-    } catch {}
+    try { await enqueueUp("POST", "/api/v1/usage", token, { fingerprintId }, {}, 6000, signal); } catch {}
+  }
+}
+async function reportZeroClickImpressions(ads, signal) {
+  const provider = ads.find((choice) => choice?.provider)?.provider;
+  const ids = ads.flatMap((choice) => Array.isArray(choice?.impressionIds) ? choice.impressionIds : []);
+  if (provider !== "zeroclick" || ids.length === 0) return;
+  try {
+    await fetch("https://zeroclick.dev/api/v2/impressions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+      signal,
+    });
+  } catch {}
+}
+export async function trackAdClick(token, env, impUrl, surface, signal) {
+  if (!token || !impUrl) return false;
+  try {
+    const result = await enqueueUp("POST", "/api/v1/ads/click", token,
+      { impUrl, ...(surface ? { surface } : {}) },
+      { "User-Agent": "Freebuff-CLI/0.0.149" }, 6000, signal);
+    return result.status >= 200 && result.status < 300;
+  } catch (error) {
+    if (env?.FREEBUFF_DEBUG === "true") console.debug("[ads] click failed", String(error?.message || error));
+    return false;
   }
 }
 
-async function createSession(token, sessionModel, forceCreate = false, signal, env) {
+async function createSession(token, sessionModel, forceCreate = false, signal, env, context = {}, account = null) {
   // Optional compatibility behavior runs before session reuse, matching the
   // ordering observed in the upstream main branch.
-  await runNormalClientBehavior(token, env, signal);
+  await runNormalClientBehavior(token, env, signal, context, account);
   // 只复用本进程仍然有效的同一模型 session。
   // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
   const cacheKey = token + ":" + sessionModel;
@@ -869,7 +954,7 @@ async function createSession(token, sessionModel, forceCreate = false, signal, e
   //    导致 chat 一直 428；强制 POST 拿全新实例）。GET 使用 CLI 的普通请求形态。
   if (!forceCreate) {
     const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
-      undefined, SESSION_TIMEOUT_MS, signal);
+      freebuffSessionGetHeaders(env, cached?.instanceId), SESSION_TIMEOUT_MS, signal);
     recordAccountObservation(token, cur.status, cur.data, {
       quota: cur.data?.rateLimitsByModel || null,
       uid: cur.data?.uid || null,
@@ -909,7 +994,7 @@ async function createSession(token, sessionModel, forceCreate = false, signal, e
 
   // 2) create（可能 queue）。官方 CLI 的 POST 只发送模型头；实例 ID 由服务端生成。
   const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
-    { "x-freebuff-model": sessionModel }, SESSION_TIMEOUT_MS, signal);
+    freebuffSessionModelHeaders(sessionModel), SESSION_TIMEOUT_MS, signal);
   recordAccountObservation(token, r.status, r.data, {
     quota: r.data?.rateLimitsByModel || null,
     uid: r.data?.uid || null,
@@ -929,7 +1014,7 @@ async function createSession(token, sessionModel, forceCreate = false, signal, e
     const inst = r.data.instanceId;
     for (let i = 0; i < 8; i++) {
       await sleep(1500);
-      const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS, signal);
+      const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, freebuffSessionInstanceHeaders(inst), SESSION_TIMEOUT_MS, signal);
       recordAccountObservation(token, q.status, q.data, {
         quota: q.data?.rateLimitsByModel || null,
         uid: q.data?.uid || null,
@@ -952,14 +1037,14 @@ async function createSession(token, sessionModel, forceCreate = false, signal, e
 // agent-runs 生命周期
 // ---------------------------------------------------------------------------
 
-async function startRun(token, agentId, ancestors = [], signal) {
+async function startRun(token, agentId, ancestors = [], signal, env) {
   const r = await enqueueUp("POST", "/api/v1/agent-runs", token,
-    { action: "START", agentId, ancestorRunIds: ancestors }, undefined, SESSION_TIMEOUT_MS, signal);
+    { action: "START", agentId, ancestorRunIds: ancestors }, env?.FREEBUFF_ACTING_USER_ID ? { [FREEBUFF_ACTING_USER_HEADER]: String(env.FREEBUFF_ACTING_USER_ID) } : undefined, SESSION_TIMEOUT_MS, signal);
   if (r.status !== 200 || !r.data?.runId) throw new Error("start_run failed: " + r.status + " " + (r.text || "").slice(0, 200));
   return r.data.runId;
 }
 
-async function finishRun(token, chain, status, errorMessage, signal) {
+async function finishRun(token, chain, status, errorMessage, signal, env) {
   await enqueueUp("POST", "/api/v1/agent-runs", token,
     {
       action: "FINISH",
@@ -970,11 +1055,11 @@ async function finishRun(token, chain, status, errorMessage, signal) {
       totalCredits: 0,
       ...(errorMessage ? { errorMessage: String(errorMessage).slice(0, 5000) } : {}),
       steps: chain.steps,
-    }, undefined, SESSION_TIMEOUT_MS, signal);
+    }, env?.FREEBUFF_ACTING_USER_ID ? { [FREEBUFF_ACTING_USER_HEADER]: String(env.FREEBUFF_ACTING_USER_ID) } : undefined, SESSION_TIMEOUT_MS, signal);
 }
 
-async function startRunChain(token, agentId, signal) {
-  const runId = await startRun(token, agentId, [], signal);
+async function startRunChain(token, agentId, signal, env) {
+  const runId = await startRun(token, agentId, [], signal, env);
   return { runId, agentId, totalSteps: 0, steps: [] };
 }
 
@@ -998,9 +1083,9 @@ function completeRunStep(chain, step, messageId = null) {
   });
 }
 
-async function finishRunChain(token, chain, status, errorMessage, signal) {
+async function finishRunChain(token, chain, status, errorMessage, signal, env) {
   if (!chain) return;
-  if (chain.runId) await finishRun(token, chain, status, errorMessage, signal).catch(() => {});
+  if (chain.runId) await finishRun(token, chain, status, errorMessage, signal, env).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,11 +1480,11 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
         // ledger records cancellation. The VPS runtime supplies a separate
         // process-level signal that only aborts FINISH during shutdown,
         // unblocking the shared queue before closeOwnedSessions sends DELETE.
-        await finishRunChain(token, run, status, errorMessage, env.SHUTDOWN_SIGNAL);
+        await finishRunChain(token, run, status, errorMessage, env.SHUTDOWN_SIGNAL, env);
       };
 
       try {
-        const sess = await createSession(token, mc.session, forceSessionRecreate, requestAbortSignal, env);
+        const sess = await createSession(token, mc.session, forceSessionRecreate, requestAbortSignal, env, chatParams, acct);
         if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
 
         // A Responses tool continuation reuses the same agent run and ledger
@@ -1418,7 +1503,7 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
           run = cachedHarnessRun.run;
           cachedHarnessRun.checkedAt = Date.now();
         } else {
-          run = await startRunChain(token, mc.agent, requestAbortSignal);
+          run = await startRunChain(token, mc.agent, requestAbortSignal, env);
         }
         if (debug) console.log(`[acct ${acctTry + 1}] run=${run.runId} agent=${mc.agent}`);
         step = beginRunStep(run);
@@ -1433,12 +1518,7 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
           step.stepNumber,
           harnessMode,
         );
-        const headers = {
-          Authorization: "Bearer " + token,
-          "Content-Type": "application/json",
-          "User-Agent": "ai-sdk/openai-compatible/0.0.149/codebuff",
-          "x-freebuff-instance-id": sess.instanceId,
-        };
+        const headers = freebuffChatHeaders(token, sess.instanceId);
         const chatInit = { method: "POST", headers, body: JSON.stringify(payload) };
         const resp = isStream
           ? await fetchStreamWithQuotaGuard(

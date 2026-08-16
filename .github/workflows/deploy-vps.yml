@@ -39,6 +39,7 @@ jobs:
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       FREEBUFF_API_KEY: ${{ secrets.FREEBUFF_API_KEY }}
       FREEBUFF_TOKEN: ${{ secrets.FREEBUFF_TOKEN }}
+      FREEBUFF_CREDENTIALS_JSON: ${{ secrets.FREEBUFF_CREDENTIALS_JSON }}
       DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
       DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
     steps:
@@ -71,6 +72,9 @@ jobs:
           set -euo pipefail
           {
             printf 'FREEBUFF_API_KEY=%s\n' "$FREEBUFF_API_KEY"
+            if [[ -n "$FREEBUFF_CREDENTIALS_JSON" ]]; then
+              printf "FREEBUFF_CREDENTIALS_JSON_B64=%s\n" "$(printf "%s" "$FREEBUFF_CREDENTIALS_JSON" | base64 -w0)"
+            fi
             printf 'FREEBUFF_TOKEN=%s\n' "$FREEBUFF_TOKEN"
           } | ssh -i "$HOME/.ssh/freebuff2api_deploy" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \

@@ -26,7 +26,7 @@ load_image() {
 
 install_secrets() {
   [[ "$ORIGINAL_COMMAND" == "install-secrets" ]] || fail "invalid install-secrets command"
-  local stage key value target seen_api=0 seen_tokens=0
+  local stage key value target seen_api=0 seen_tokens=0 seen_credentials=0
   stage="$(mktemp -d /run/freebuff2api-stage.XXXXXX)"
   trap 'rm -rf "$stage"' RETURN
   chmod 0711 "$stage"
@@ -37,16 +37,22 @@ install_secrets() {
     value="${line#*=}"
     case "$key" in
       FREEBUFF_API_KEY) target="api_key"; seen_api=1 ;;
-      FREEBUFF_TOKEN) target="upstream_tokens"; seen_tokens=1 ;;
+      FREEBUFF_TOKEN) target="upstream_tokens"; [[ -n "$value" ]] && seen_tokens=1 ;;
+      FREEBUFF_CREDENTIALS_JSON_B64) target="upstream_credentials_json"; seen_credentials=1 ;;
       CODEBUFF_API) target="codebuff_api" ;;
       *) fail "unknown secret name" ;;
     esac
-    printf '%s' "$value" > "$stage/$target"
+    if [[ "$key" == "FREEBUFF_CREDENTIALS_JSON_B64" ]]; then
+      printf "%s" "$value" | /usr/bin/base64 -d > "$stage/$target" || fail "invalid credentials JSON encoding"
+      [[ -s "$stage/$target" ]] || fail "empty credentials JSON"
+    else
+      printf "%s" "$value" > "$stage/$target"
+    fi
     chown root:root "$stage/$target"
     chmod 0400 "$stage/$target"
   done
 
-  [[ "$seen_api" == 1 && "$seen_tokens" == 1 ]] || fail "required runtime secrets missing"
+  [[ "$seen_api" == 1 && ( "$seen_tokens" == 1 || "$seen_credentials" == 1 ) ]] || fail "api key and one upstream credential source are required"
   rm -rf "${SECRET_DIR}.previous"
   if [[ -d "$SECRET_DIR" ]]; then mv "$SECRET_DIR" "${SECRET_DIR}.previous"; fi
   mv "$stage" "$SECRET_DIR"

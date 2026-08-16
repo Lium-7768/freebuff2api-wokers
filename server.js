@@ -26,49 +26,57 @@ function readRuntimeSecret(name) {
   }
 }
 
-// Read tokens from credentials/ directory
-const credDir = resolve(__dirname, 'credentials');
+// Read legacy authToken files from credentials/. Official credentials JSON is passed unchanged below.
+const credDir = resolve(__dirname, "credentials");
 let tokenLines = [];
 if (existsSync(credDir)) {
   for (const f of readdirSync(credDir)) {
-    if (!f.endsWith('.json')) continue;
+    if (!f.endsWith(".json")) continue;
     try {
-      const raw = readFileSync(resolve(credDir, f), 'utf-8');
+      const raw = readFileSync(resolve(credDir, f), "utf-8");
       const obj = JSON.parse(raw);
-      if (obj.authToken) tokenLines.push(obj.authToken.trim());
+      if (typeof obj?.authToken === "string" && obj.authToken.trim()) tokenLines.push(obj.authToken.trim());
     } catch (err) {
       console.error(`[server] skip bad credential ${f}: ${err.message}`);
     }
   }
 }
 
-// Prefer runtime secret files in production.  Environment variables remain
-// a local-development fallback and are not required by the deployment path.
-const tokenSource = readRuntimeSecret('upstream_tokens') || process.env.FREEBUFF_TOKEN || '';
+// Prefer root-only runtime secret files in production. Environment variables remain a local-development fallback.
+const tokenSource = readRuntimeSecret("upstream_tokens") || process.env.FREEBUFF_TOKEN || "";
 if (tokenSource) {
   for (const tok of tokenSource.split(/[\n,]/)) {
-    const t = tok.trim();
-    if (t && !tokenLines.includes(t)) tokenLines.push(t);
+    const token = tok.trim();
+    if (token && !tokenLines.includes(token)) tokenLines.push(token);
   }
 }
+const credentialsJson = readRuntimeSecret("upstream_credentials_json") || process.env.FREEBUFF_CREDENTIALS_JSON || "";
 
-const apiKey = String(readRuntimeSecret('api_key') || process.env.FREEBUFF_API_KEY || '').trim();
+const apiKey = String(readRuntimeSecret("api_key") || process.env.FREEBUFF_API_KEY || "").trim();
 if (!apiKey) {
-  throw new Error('FREEBUFF_API_KEY is required; refusing to start with a public default key');
+  throw new Error("FREEBUFF_API_KEY is required; refusing to start with a public default key");
 }
 
 const env = {
-  FREEBUFF_TOKEN: tokenLines.join(','),
+  FREEBUFF_TOKEN: tokenLines.join(","),
+  FREEBUFF_CREDENTIALS_JSON: credentialsJson,
   FREEBUFF_API_KEY: apiKey,
-  FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
-  FREEBUFF_CLIENT_BEHAVIOR: process.env.FREEBUFF_CLIENT_BEHAVIOR || 'off',
-  FREEBUFF_FINGERPRINT_ID: process.env.FREEBUFF_FINGERPRINT_ID || '',
-  CODEBUFF_API: readRuntimeSecret('codebuff_api') || process.env.CODEBUFF_API || '',
+  FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || "false",
+  FREEBUFF_CLIENT_BEHAVIOR: process.env.FREEBUFF_CLIENT_BEHAVIOR || "cli",
+  FREEBUFF_FINGERPRINT_ID: process.env.FREEBUFF_FINGERPRINT_ID || "",
+  FREEBUFF_ACTING_USER_ID: process.env.FREEBUFF_ACTING_USER_ID || "",
+  FREEBUFF_COMPACT_SESSION: process.env.FREEBUFF_COMPACT_SESSION || "",
+  FREEBUFF_AD_PROVIDER: process.env.FREEBUFF_AD_PROVIDER || "",
+  FREEBUFF_AD_SURFACE: process.env.FREEBUFF_AD_SURFACE || "",
+  FREEBUFF_AD_PLACEMENT_ID: process.env.FREEBUFF_AD_PLACEMENT_ID || "",
+  FREEBUFF_AGENT_MODE: process.env.FREEBUFF_AGENT_MODE || "",
+  FREEBUFF_CHAT_SESSION_ID: process.env.FREEBUFF_CHAT_SESSION_ID || "",
+  CODEBUFF_API: readRuntimeSecret("codebuff_api") || process.env.CODEBUFF_API || "",
 };
 const shutdownSignalController = new AbortController();
 env.SHUTDOWN_SIGNAL = shutdownSignalController.signal;
 
-console.log(`[server] start: ${tokenLines.length} tokens, apiKeyConfigured=true, debug=${env.FREEBUFF_DEBUG}`);
+console.log(`[server] start: ${tokenLines.length + (credentialsJson ? 1 : 0)} credential sources, apiKeyConfigured=true, debug=${env.FREEBUFF_DEBUG}`);
 if (env.CODEBUFF_API) console.log('[server] CODEBUFF_API configured');
 
 // === HTTP server ===

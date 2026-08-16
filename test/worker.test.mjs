@@ -64,6 +64,7 @@ function mockUpstream({ onChat, onSessionGet, onSessionPost, onSessionDelete, ca
       path: parsed.pathname,
       method: init.method || 'GET',
       auth: init.headers?.Authorization || init.headers?.authorization || null,
+      headers: Object.fromEntries(Object.entries(init.headers || {}).map(([key, value]) => [key.toLowerCase(), value])),
       body,
       signal: init.signal,
     };
@@ -246,6 +247,7 @@ test('an owned session below the reuse window is deleted and recreated', async (
     onSessionDelete: (call) => {
       assert.equal(call.signal.aborted, false);
       assert.equal(currentSession.instanceId, 'expiring-instance-1');
+      assert.equal(call.headers['x-freebuff-instance-id'], undefined);
       currentSession = null;
       return { ok: true };
     },
@@ -925,4 +927,104 @@ test('account retry never selects the same account twice in one request', async 
   const routes = calls.filter((call) => call.path === '/api/v1/chat/completions').map((call) => call.auth);
   assert.equal(routes.length, 2);
   assert.notEqual(routes[0], routes[1]);
+});
+
+test('explicit acting-user identity is forwarded only to agent-runs', async () => {
+  const calls = [];
+  mockUpstream({ calls });
+  const response = await worker.fetch(
+    request('/v1/chat/completions', chatBody()),
+    { ...env(), FREEBUFF_ACTING_USER_ID: 'user-explicit-1' },
+  );
+  assert.equal(response.status, 200);
+  const runs = calls.filter((call) => call.path === '/api/v1/agent-runs');
+  assert.equal(runs.length, 2);
+  assert.equal(runs[0].headers['x-freebuff-acting-user-id'], 'user-explicit-1');
+  assert.equal(runs[1].headers['x-freebuff-acting-user-id'], 'user-explicit-1');
+  const nonRuns = calls.filter((call) => call.path !== '/api/v1/agent-runs');
+  assert.equal(nonRuns.some((call) => call.headers['x-freebuff-acting-user-id']), false);
+});
+
+test('an omitted model follows the CLI selectedModel default to DeepSeek V4 Pro', async () => {
+  const calls = [];
+  mockUpstream({ calls });
+  const body = chatBody();
+  delete body.model;
+  const response = await worker.fetch(request('/v1/chat/completions', body), env());
+  assert.equal(response.status, 200);
+  const sessionPost = calls.find((call) => call.path === '/api/v1/freebuff/session' && call.method === 'POST');
+  const chat = calls.find((call) => call.path === '/api/v1/chat/completions');
+  assert.equal(sessionPost.headers['x-freebuff-model'], 'deepseek/deepseek-v4-pro');
+  assert.equal(chat.body.model, 'deepseek/deepseek-v4-pro');
+});
+
+test('default CLI request sequence keeps fingerprint only in usage and preserves wire fields', async () => {
+  const calls = [];
+  mockUpstream({ calls });
+  const response = await worker.fetch(request('/v1/chat/completions', chatBody()), env());
+  assert.equal(response.status, 200);
+  const ads = calls.find((call) => call.path === '/api/v1/ads');
+  const usage = calls.find((call) => call.path === '/api/v1/usage');
+  const sessionPost = calls.find((call) => call.path === '/api/v1/freebuff/session' && call.method === 'POST');
+  const chat = calls.find((call) => call.path === '/api/v1/chat/completions');
+  const runCalls = calls.filter((call) => call.path === '/api/v1/agent-runs');
+  assert.equal(ads.headers.authorization, sessionPost.headers.authorization);
+  assert.equal(ads.headers['user-agent'], 'Freebuff-CLI/0.0.149');
+  assert.equal(ads.body.provider, 'gravity');
+  assert.equal(ads.body.messages[0].role, 'user');
+  assert.equal(typeof ads.body.sessionId, 'string');
+  assert.equal(ads.body.device.os, 'linux');
+  assert.match(ads.body.userAgent, /Chrome\/124\.0\.0\.0/);
+  assert.deepEqual(usage.body, { fingerprintId: 'cli-usage' });
+  assert.equal(usage.headers.authorization, sessionPost.headers.authorization);
+  assert.equal(sessionPost.headers['x-freebuff-model'], 'deepseek/deepseek-v4-flash');
+  assert.equal(chat.headers['user-agent'], 'ai-sdk/openai-compatible/0.0.149/codebuff');
+  assert.equal(chat.headers['x-freebuff-instance-id'], sessionPost.body?.instanceId || `instance-${sessionPost.auth}`);
+  assert.equal(chat.body.provider.data_collection, 'deny');
+  assert.equal(chat.body.codebuff_metadata.cost_mode, 'free');
+  assert.equal(chat.body.codebuff_metadata.llm_step_number, '1');
+  for (const call of [sessionPost, chat, ...runCalls]) {
+    assert.equal(Object.hasOwn(call.body || {}, 'fingerprintId'), false);
+    assert.equal(Object.hasOwn(call.headers, 'fingerprintid'), false);
+  }
+});
+
+test("official credentials JSON maps only authToken and usage fingerprintId", async () => {
+  const calls = [];
+  mockUpstream({ calls });
+  const credentials = {
+    default: {
+      id: "official-user-42",
+      name: "official-name-must-not-leak",
+      email: "official-email-must-not-leak@example.test",
+      authToken: "official-token-aaaaaaaa",
+      fingerprintId: "enhanced-official-fingerprint",
+      fingerprintHash: "official-hash-must-not-leak",
+    },
+  };
+  const runtime = env([]);
+  runtime.FREEBUFF_CREDENTIALS_JSON = JSON.stringify(credentials);
+  const response = await worker.fetch(request("/v1/chat/completions", chatBody()), runtime);
+  assert.equal(response.status, 200);
+  assert.equal(calls.every((call) => call.auth === "Bearer official-token-aaaaaaaa"), true);
+  const usage = calls.find((call) => call.path === "/api/v1/usage");
+  assert.deepEqual(usage.body, { fingerprintId: "enhanced-official-fingerprint" });
+  const agentRuns = calls.filter((call) => call.path === "/api/v1/agent-runs");
+  assert.equal(agentRuns.some((call) => Object.hasOwn(call.headers, "x-freebuff-acting-user-id")), false);
+  for (const call of calls) {
+    const requestWire = JSON.stringify({ headers: call.headers, body: call.body });
+    assert.equal(requestWire.includes(credentials.default.id), false);
+    assert.equal(requestWire.includes(credentials.default.name), false);
+    assert.equal(requestWire.includes(credentials.default.email), false);
+    assert.equal(requestWire.includes(credentials.default.fingerprintHash), false);
+  }
+});
+
+test("invalid or missing official credentials JSON does not create an account", async () => {
+  for (const raw of [undefined, "{invalid-json", JSON.stringify({ default: { authToken: "short" } })]) {
+    const runtime = env([]);
+    if (raw !== undefined) runtime.FREEBUFF_CREDENTIALS_JSON = raw;
+    const response = await worker.fetch(request("/v1/chat/completions", chatBody()), runtime);
+    assert.equal(response.status, 503);
+  }
 });

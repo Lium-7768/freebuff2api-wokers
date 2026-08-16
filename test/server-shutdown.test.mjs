@@ -68,7 +68,7 @@ test('SIGTERM aborts a request whose FINISH is hanging and still deletes the own
       return;
     }
     if (url.pathname === '/api/v1/freebuff/session' && req.method === 'DELETE') {
-      assert.equal(req.headers['x-freebuff-instance-id'], instanceId);
+      assert.equal(req.headers['x-freebuff-instance-id'], undefined);
       deleteCount += 1;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));

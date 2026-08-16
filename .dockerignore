@@ -2,7 +2,6 @@
 .env
 .env.*
 credentials/
-wrangler.toml
 freebuff_tools/freebuff_credentials.json
 freebuff_tools/freebuff_credentials.example.json
 
@@ -11,7 +10,6 @@ freebuff_tools/freebuff_credentials.example.json
 .gitignore
 .github/
 .hermes/
-.vercel/
 
 # 测试与日志
 test/

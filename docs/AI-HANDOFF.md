@@ -28,7 +28,7 @@ state:  重构已提交；用 git status / git rev-parse HEAD 获取实时状态
 
 ## 不要误改
 
-- 不要恢复 Cloudflare Worker 或 Vercel 特有逻辑。
+- 不要恢复其他云平台特有逻辑。
 - 不要让 `/healthz` 主动请求上游。
 - 不要默认开启广告/usage 或伪造设备信息；只有用户显式设置 `FREEBUFF_CLIENT_BEHAVIOR=cli` 时才启用兼容请求。
 - 不要把 `rate_limited` 当成永久无效 token。

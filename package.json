@@ -6,7 +6,7 @@
   "description": "Freebuff OpenAI-compatible adapter for a self-hosted Node/VPS runtime",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test --test-concurrency=1 test/worker.test.mjs test/server-shutdown.test.mjs",
+    "test": "node --test --test-concurrency=1 test/worker.test.mjs test/server-shutdown.test.mjs test/server-runtime-secrets.test.mjs",
     "test:e2e": "node test/e2e-local.mjs",
     "audit:protocol": "node scripts/audit/protocol-audit.mjs && node scripts/audit/responses-history-audit.mjs"
   },
