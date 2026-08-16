@@ -7,7 +7,7 @@ readonly APP_NAME="freebuff2api"
 readonly SECRET_DIR="/run/freebuff2api"
 readonly CANDIDATE_PORT="8878"
 readonly PRODUCTION_PORT="8877"
-readonly ORIGINAL_COMMAND="${SSH_ORIGINAL_COMMAND:-}"
+readonly ORIGINAL_COMMAND="${*:-${SSH_ORIGINAL_COMMAND:-}}"
 
 fail() {
   echo "deployment command rejected: $*" >&2
