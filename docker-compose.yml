@@ -11,8 +11,7 @@ services:
       # 上游地址：默认空=直连官方 www.codebuff.com
       - CODEBUFF_API=
       - FREEBUFF_API_KEY=${FREEBUFF_API_KEY:?FREEBUFF_API_KEY is required}
-      - FREEBUFF_TOKEN=${FREEBUFF_TOKEN:-}
-      - FREEBUFF_CREDENTIALS_JSON=${FREEBUFF_CREDENTIALS_JSON:-}
+      - FREEBUFF_CREDENTIALS_JSON=${FREEBUFF_CREDENTIALS_JSON:?FREEBUFF_CREDENTIALS_JSON is required}
       - FREEBUFF_DEBUG=false
     volumes:
       - ./credentials:/app/credentials:ro

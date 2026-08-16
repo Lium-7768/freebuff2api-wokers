@@ -24,14 +24,17 @@ async function waitForStart(child) {
 test('server loads production runtime secrets from files without app secret environment variables', async () => {
   const secretDir = await mkdtemp(join(tmpdir(), 'freebuff-runtime-secrets-'));
   await writeFile(join(secretDir, 'api_key'), 'runtime-api-key');
-  await writeFile(join(secretDir, 'upstream_tokens'), 'token-a,token-b');
+  await writeFile(join(secretDir, 'upstream_credentials_json'), JSON.stringify([
+    { authToken: 'token-a-aaaaaaaa', fingerprintId: 'fp-a' },
+    { authToken: 'token-b-bbbbbbbb', fingerprintId: 'fp-b' },
+  ]));
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
     env: {
       ...process.env,
       FREEBUFF_SECRETS_DIR: secretDir,
       FREEBUFF_API_KEY: '',
-      FREEBUFF_TOKEN: '',
+      FREEBUFF_CREDENTIALS_JSON: '',
       PORT: '0',
       HOST: '127.0.0.1',
     },
@@ -39,7 +42,7 @@ test('server loads production runtime secrets from files without app secret envi
   });
   try {
     const output = await waitForStart(child);
-    assert.match(output, /start: 2 credential sources, apiKeyConfigured=true/);
+    assert.match(output, /start: 1 credential sources, apiKeyConfigured=true/);
   } finally {
     child.kill('SIGTERM');
     await once(child, 'exit');
@@ -59,7 +62,7 @@ test("server loads official credentials JSON from the root-only runtime secret d
       ...process.env,
       FREEBUFF_SECRETS_DIR: secretDir,
       FREEBUFF_API_KEY: "",
-      FREEBUFF_TOKEN: "",
+      FREEBUFF_CREDENTIALS_JSON: "",
       FREEBUFF_CREDENTIALS_JSON: "",
       PORT: "0",
       HOST: "127.0.0.1",

@@ -26,44 +26,53 @@ function readRuntimeSecret(name) {
   }
 }
 
-// Read legacy authToken files from credentials/. Official credentials JSON is passed unchanged below.
+// Read complete account JSON documents from credentials/. They are preserved
+// so account-specific fingerprintId values are not discarded.
 const credDir = resolve(__dirname, "credentials");
-let tokenLines = [];
+const credentialDocuments = [];
 if (existsSync(credDir)) {
   for (const f of readdirSync(credDir)) {
     if (!f.endsWith(".json")) continue;
     try {
       const raw = readFileSync(resolve(credDir, f), "utf-8");
       const obj = JSON.parse(raw);
-      if (typeof obj?.authToken === "string" && obj.authToken.trim()) tokenLines.push(obj.authToken.trim());
+      if (obj && typeof obj === "object") credentialDocuments.push(obj);
     } catch (err) {
       console.error(`[server] skip bad credential ${f}: ${err.message}`);
     }
   }
 }
 
-// Prefer root-only runtime secret files in production. Environment variables remain a local-development fallback.
-const tokenSource = readRuntimeSecret("upstream_tokens") || process.env.FREEBUFF_TOKEN || "";
-if (tokenSource) {
-  for (const tok of tokenSource.split(/[\n,]/)) {
-    const token = tok.trim();
-    if (token && !tokenLines.includes(token)) tokenLines.push(token);
+const credentialsJson = readRuntimeSecret("upstream_credentials_json") || process.env.FREEBUFF_CREDENTIALS_JSON || "";
+let credentialSourceJson = credentialsJson;
+if (credentialDocuments.length > 0) {
+  try {
+    // Preserve complete account records from credentials/*.json. If an
+    // explicit JSON secret is also configured, combine both documents; the
+    // worker deduplicates by authToken and keeps the matching fingerprintId.
+    const configured = credentialsJson ? JSON.parse(credentialsJson) : null;
+    const documents = configured === null ? credentialDocuments : [configured, ...credentialDocuments];
+    credentialSourceJson = JSON.stringify(documents.length === 1 ? documents[0] : documents);
+  } catch {
+    // Keep an explicitly supplied value unchanged if it is malformed so the
+    // worker can return a clear credentials configuration error.
+    credentialSourceJson = credentialsJson;
   }
 }
-const credentialsJson = readRuntimeSecret("upstream_credentials_json") || process.env.FREEBUFF_CREDENTIALS_JSON || "";
 
 const apiKey = String(readRuntimeSecret("api_key") || process.env.FREEBUFF_API_KEY || "").trim();
 if (!apiKey) {
   throw new Error("FREEBUFF_API_KEY is required; refusing to start with a public default key");
 }
+if (String(process.env.FREEBUFF_TOKEN || "").trim() || String(process.env.FREEBUFF_FINGERPRINT_ID || "").trim()) {
+  throw new Error("FREEBUFF_TOKEN and FREEBUFF_FINGERPRINT_ID are unsupported; use FREEBUFF_CREDENTIALS_JSON");
+}
 
 const env = {
-  FREEBUFF_TOKEN: tokenLines.join(","),
-  FREEBUFF_CREDENTIALS_JSON: credentialsJson,
+  FREEBUFF_CREDENTIALS_JSON: credentialSourceJson,
   FREEBUFF_API_KEY: apiKey,
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || "false",
   FREEBUFF_CLIENT_BEHAVIOR: process.env.FREEBUFF_CLIENT_BEHAVIOR || "cli",
-  FREEBUFF_FINGERPRINT_ID: process.env.FREEBUFF_FINGERPRINT_ID || "",
   FREEBUFF_ACTING_USER_ID: process.env.FREEBUFF_ACTING_USER_ID || "",
   FREEBUFF_COMPACT_SESSION: process.env.FREEBUFF_COMPACT_SESSION || "",
   FREEBUFF_AD_PROVIDER: process.env.FREEBUFF_AD_PROVIDER || "",
@@ -76,7 +85,7 @@ const env = {
 const shutdownSignalController = new AbortController();
 env.SHUTDOWN_SIGNAL = shutdownSignalController.signal;
 
-console.log(`[server] start: ${tokenLines.length + (credentialsJson ? 1 : 0)} credential sources, apiKeyConfigured=true, debug=${env.FREEBUFF_DEBUG}`);
+console.log(`[server] start: ${credentialDocuments.length + (credentialsJson ? 1 : 0)} credential sources, apiKeyConfigured=true, debug=${env.FREEBUFF_DEBUG}`);
 if (env.CODEBUFF_API) console.log('[server] CODEBUFF_API configured');
 
 // === HTTP server ===

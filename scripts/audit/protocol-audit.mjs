@@ -9,7 +9,7 @@ let calls = [];
 function env() {
   tokenNumber += 1;
   return {
-    FREEBUFF_TOKEN: `audit-token-${tokenNumber}-aaaaaaaa`,
+    FREEBUFF_CREDENTIALS_JSON: JSON.stringify([{ authToken: `audit-token-${tokenNumber}-aaaaaaaa`, fingerprintId: `fp-audit-${tokenNumber}` }]),
     FREEBUFF_API_KEY: API_KEY,
     FREEBUFF_DEBUG: 'false',
   };

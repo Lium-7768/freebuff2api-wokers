@@ -74,7 +74,10 @@ try {
       PORT: String(serverPort),
       CODEBUFF_API: `http://127.0.0.1:${upstreamPort}`,
       FREEBUFF_API_KEY: 'e2e-key',
-      FREEBUFF_TOKEN: 'token-e2e-a-aaaaaaaa,token-e2e-b-bbbbbbbb',
+      FREEBUFF_CREDENTIALS_JSON: JSON.stringify([
+        { authToken: 'token-e2e-a-aaaaaaaa', fingerprintId: 'fp-e2e-a' },
+        { authToken: 'token-e2e-b-bbbbbbbb', fingerprintId: 'fp-e2e-b' },
+      ]),
       FREEBUFF_DEBUG: 'false',
     },
     stdio: ['ignore', 'pipe', 'pipe'],

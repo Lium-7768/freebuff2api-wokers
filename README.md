@@ -56,13 +56,7 @@ POST /v1/messages/count_tokens
 
 ## 多账号
 
-推荐一行一个 token，也支持英文逗号：
-
-```bash
-export FREEBUFF_TOKEN='token-a,token-b,token-c'
-```
-
-轮询顺序：
+账号按 credentials JSON 中的配置顺序轮询：
 
 ```text
 A → B → C → A → B → C
@@ -70,20 +64,35 @@ A → B → C → A → B → C
 
 每个账号复用自己的 session。明确限流或临时错误才切换账号；session gate 原样返回，不跨账号抢 seat。
 
-也可以使用传统凭证目录；该目录中的单账号文件只读取 `authToken`：
+也可以使用完整账号 JSON。推荐把官方 CLI 的多账号文件原样传入；每个账号的 `authToken` 与 `fingerprintId` 会绑定在同一条轮询记录中：
+
+```bash
+export FREEBUFF_CREDENTIALS_JSON="$(cat freebuff_tools/freebuff_credentials.json)"
+```
+
+支持的格式包括官方的 `{accounts:{accountKey:{...}}}`、`{default:{...}}`、JSON 数组，以及每行一个完整账号对象。JSON 数组示例：
+
+```json
+[
+  {"id":"user-a","authToken":"token-a","fingerprintId":"fp-a"},
+  {"id":"user-b","authToken":"token-b","fingerprintId":"fp-b"}
+]
+```
+
+也可以使用传统凭证目录；每个文件可直接保存一个完整账号对象：
 
 ```text
 credentials/account-a.json
 credentials/account-b.json
 ```
 
-若要直接使用官方 CLI 导出的 `{default:{...}}` 凭证容器，设置 `FREEBUFF_CREDENTIALS_JSON`。适配器只读取其中的 `authToken` 与 `fingerprintId`；`id`、`name`、`email`、`fingerprintHash` 不会加入聊天、session 或 agent-runs 请求：
+若使用官方 CLI 导出的 `{default:{...}}` 凭证容器，也可直接设置 `FREEBUFF_CREDENTIALS_JSON`。适配器只读取其中的 `authToken` 与 `fingerprintId`；`id`、`name`、`email`、`fingerprintHash` 不会加入聊天、session 或 agent-runs 请求：
 
 ```bash
 export FREEBUFF_CREDENTIALS_JSON="$(cat credentials/default.json)"
 ```
 
-其中 `fingerprintId` 仅用于 `/api/v1/usage` body；环境变量 `FREEBUFF_FINGERPRINT_ID` 若显式设置，会覆盖凭证中的该字段。
+其中每个账号的 `fingerprintId` 仅用于该账号的 `/api/v1/usage` body。
 
 ## Node/VPS 启动
 
@@ -93,7 +102,7 @@ export FREEBUFF_CREDENTIALS_JSON="$(cat credentials/default.json)"
 npm install
 
 export FREEBUFF_API_KEY="$(openssl rand -hex 32)"
-export FREEBUFF_TOKEN='token-a,token-b'
+export FREEBUFF_CREDENTIALS_JSON="$(cat freebuff_tools/freebuff_credentials.json)"
 export HOST='0.0.0.0'
 export PORT='8787'
 
@@ -178,16 +187,16 @@ Harness 的本地工具仍由 Harness 执行；VPS 只负责上游 session、SSE
 | 变量 | 必需 | 默认值 | 说明 |
 |---|---|---|---|
 | `FREEBUFF_API_KEY` | 是 | 无 | 本服务访问密钥 |
-| `FREEBUFF_TOKEN` | 否 | 无 | 传统 Freebuff token 列表；可与 `FREEBUFF_CREDENTIALS_JSON` 同时使用 |
-| `FREEBUFF_CREDENTIALS_JSON` | 否 | 无 | 官方 `{default:{authToken,fingerprintId,...}}` JSON；优先使用其中的 authToken 与 usage fingerprintId |
+| `FREEBUFF_CREDENTIALS_JSON` | 是 | 无 | 多账号完整 JSON：官方 `{accounts:{...}}`、`{default:{...}}`、JSON 数组或 JSONL；每个账号的 authToken 与 fingerprintId 成对轮转 |
 | `HOST` | 否 | `0.0.0.0` | 监听地址 |
 | `PORT` | 否 | `8787` | 监听端口 |
-| `FREEBUFF_FINGERPRINT_ID` | 否 | `cli-usage` | `FREEBUFF_CLIENT_BEHAVIOR=cli` 时覆盖凭证中的 fingerprintId，仅用于 usage body |
 | `CODEBUFF_API` | 否 | `https://www.codebuff.com` | 上游地址 |
 | `FREEBUFF_DEBUG` | 否 | `false` | 输出脱敏路由日志 |
 | `FREEBUFF_CLIENT_BEHAVIOR` | 否 | `cli` | `cli` 按报告启用 ads/usage；`off` 显式关闭；`harness` 仅启用 Harness 工具名/多 step 兼容 |
 | `SHUTDOWN_GRACE_MS` | 否 | `5000` | SIGINT/SIGTERM 等待活动 HTTP 请求的毫秒数；可设为 `0` |
 | `SHUTDOWN_CLEANUP_TIMEOUT_MS` | 否 | `5000` | 退出时等待 session DELETE 的毫秒数；可设为 `0` |
+
+`FREEBUFF_TOKEN` 和 `FREEBUFF_FINGERPRINT_ID` 不再支持；服务启动时若检测到这两个变量会直接报错。请使用完整的 `FREEBUFF_CREDENTIALS_JSON`。
 
 ### VPS 部署边界
 
@@ -208,7 +217,7 @@ npm run audit:protocol
 ## 架构边界
 
 本项目是协议适配器，不是完整 Freebuff CLI runtime：
-- 浏览器登录仍由 `freebuff_tools` 或官方 CLI 负责。服务端可接收官方 credentials JSON，但不执行浏览器登录或完整 credentials 管理；默认按报告发送 ads/usage；如需显式停用可设置 `FREEBUFF_CLIENT_BEHAVIOR=off`。`FREEBUFF_FINGERPRINT_ID` 仅用于 usage body，默认值为 `cli-usage`。
+- 浏览器登录仍由 `freebuff_tools` 或官方 CLI 负责。服务端只接收官方 credentials JSON，不执行浏览器登录或完整 credentials 管理；默认按报告发送 ads/usage；如需显式停用可设置 `FREEBUFF_CLIENT_BEHAVIOR=off`。
 - 不在 VPS 执行官方15个本地工具。
 - 支持 Responses `previous_response_id` 的客户端驱动多 step run 续接，但不在 VPS 执行官方15个本地工具；工具仍由 Codex/SDK 客户端执行。
 - Codex 工具由 Codex 客户端执行，本服务负责正确传递 tool call/result。

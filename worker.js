@@ -253,36 +253,84 @@ function mapClientTools(params, enabled) {
   return { ...params, tools, tool_choice: toolChoice, messages: mapToolMessages(params.messages, aliases) };
 }
 
-function parseOfficialCredential(raw) {
-  if (!raw || typeof raw !== "string") return null;
-  try {
-    const parsed = JSON.parse(raw);
-    const credential = parsed?.default && typeof parsed.default === "object" ? parsed.default : parsed;
-    const token = typeof credential?.authToken === "string" ? credential.authToken.trim() : "";
-    if (token.length <= 8) return null;
-    return {
-      token,
-      uid: typeof credential.id === "string" && credential.id ? credential.id : null,
-      fingerprintId: typeof credential.fingerprintId === "string" && credential.fingerprintId ? credential.fingerprintId : null,
-    };
-  } catch {
-    return null;
+function normalizeCredentialObject(credential) {
+  if (!credential || typeof credential !== "object" || Array.isArray(credential)) return null;
+  const token = typeof credential.authToken === "string" ? credential.authToken.trim() : "";
+  if (token.length <= 8) return null;
+  return {
+    token,
+    uid: typeof credential.id === "string" && credential.id.trim() ? credential.id.trim() : null,
+    // Keep the fingerprint on the same account record as authToken. Never
+    // derive it from a separate positional list during account rotation.
+    fingerprintId: typeof credential.fingerprintId === "string" && credential.fingerprintId.trim()
+      ? credential.fingerprintId.trim()
+      : null,
+  };
+}
+
+function appendCredentialContainer(container, candidates) {
+  if (Array.isArray(container)) {
+    for (const value of container) {
+      if (value && typeof value === "object") candidates.push(value);
+    }
+    return;
+  }
+  if (!container || typeof container !== "object") return;
+  if (typeof container.authToken === "string") {
+    candidates.push(container);
+    return;
+  }
+  for (const value of Object.values(container)) {
+    if (value && typeof value === "object" && !Array.isArray(value)) candidates.push(value);
   }
 }
+
+function credentialCandidates(parsed) {
+  if (Array.isArray(parsed)) return parsed.flatMap((value) => credentialCandidates(value));
+  if (!parsed || typeof parsed !== "object") return [];
+
+  const candidates = [];
+  // Official local files use {accounts: {accountKey: {...}}}. Arrays and
+  // {credentials: ...} are also accepted for simple VPS secret generation.
+  appendCredentialContainer(parsed.accounts, candidates);
+  appendCredentialContainer(parsed.credentials, candidates);
+  if (parsed.default && typeof parsed.default === "object") candidates.push(parsed.default);
+  if (typeof parsed.authToken === "string") candidates.push(parsed);
+  return candidates;
+}
+
+function parseOfficialCredentials(raw) {
+  if (!raw || typeof raw !== "string") return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Secret files may contain one complete account JSON object per line.
+    const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length === 0) return [];
+    const documents = [];
+    for (const line of lines) {
+      try { documents.push(JSON.parse(line)); } catch { return []; }
+    }
+    parsed = documents;
+  }
+  return credentialCandidates(parsed).map(normalizeCredentialObject).filter(Boolean);
+}
+
 function parseAccounts(env) {
-  // FREEBUFF_CREDENTIALS_JSON accepts the official {default:{...}} credentials container.
-  // Only authToken and the usage-specific fingerprintId are protocol inputs.
+  // Supported credential input: official {accounts:{...}}, {default:{...}},
+  // a JSON array, or newline-delimited complete account objects. Each
+  // normalized record keeps authToken and its matching fingerprintId together.
   const seen = new Set();
   const accounts = [];
-  const credential = parseOfficialCredential(env.FREEBUFF_CREDENTIALS_JSON);
-  if (credential) accounts.push(credential);
-  for (const item of String(env.FREEBUFF_TOKEN || "").split(/[\n,]/)) {
-    const entry = item.trim();
-    if (entry.length <= 8) continue;
-    const idx = entry.indexOf(":");
-    accounts.push(idx > 0
-      ? { token: entry.slice(0, idx).trim(), uid: entry.slice(idx + 1).trim() || null, fingerprintId: null }
-      : { token: entry, uid: null, fingerprintId: null });
+  for (const credential of parseOfficialCredentials(env.FREEBUFF_CREDENTIALS_JSON)) {
+    const existing = accounts.find((account) => account.token === credential.token);
+    if (existing) {
+      if (!existing.uid && credential.uid) existing.uid = credential.uid;
+      if (!existing.fingerprintId && credential.fingerprintId) existing.fingerprintId = credential.fingerprintId;
+      continue;
+    }
+    accounts.push(credential);
   }
   return accounts.filter((account) => {
     if (account.token.length <= 8 || seen.has(account.token)) return false;
@@ -872,7 +920,7 @@ function behaviorDue(key) {
 
 async function runNormalClientBehavior(token, env, signal, context = {}, account = null) {
   if (String(env?.FREEBUFF_CLIENT_BEHAVIOR || "cli").toLowerCase() !== "cli") return;
-  const fingerprintId = String(env.FREEBUFF_FINGERPRINT_ID || account?.fingerprintId || "cli-usage");
+  const fingerprintId = String(account?.fingerprintId || "cli-usage");
   const localeOptions = Intl.DateTimeFormat().resolvedOptions();
   const device = { os: "linux", timezone: localeOptions.timeZone || "UTC", locale: localeOptions.locale || "en-US" };
   const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -1420,7 +1468,7 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
     ? chatParams.__harness_session_id.trim() : "";
   const harnessRunKey = harnessSessionId ? `${harnessSessionId}:${mc.session}` : null;
   const pool = parseAccounts(env);
-  if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
+  if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_CREDENTIALS_JSON（官方 credentials JSON）", type: "config_error" } }, 503);
 
   let releaseChatSlot;
   try {

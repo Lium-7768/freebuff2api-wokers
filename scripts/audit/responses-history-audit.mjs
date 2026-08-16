@@ -53,7 +53,7 @@ const request = new Request('http://local/v1/responses', {
   }),
 });
 const response = await worker.fetch(request, {
-  FREEBUFF_TOKEN: 'history-audit-token-aaaaaaaa',
+  FREEBUFF_CREDENTIALS_JSON: JSON.stringify([{ authToken: 'history-audit-token-aaaaaaaa', fingerprintId: 'fp-history' }]),
   FREEBUFF_API_KEY: 'audit',
   FREEBUFF_DEBUG: 'false',
 });

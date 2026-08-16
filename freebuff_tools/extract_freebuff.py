@@ -26,7 +26,7 @@ GitHub Actions 里的安全行为（重要）：
 环境变量：
   TG_BOT_TOKEN         Telegram Bot Token（可选；与 TG_CHAT_ID 一起配置才推送）
   TG_CHAT_ID           Telegram 接收 chat_id（可选）
-  FREEBUFF_TOKEN       手动指定 authToken（跳过 credentials 文件）
+  凭证文件             freebuff_credentials.json（完整账号 JSON）
 
 依赖：仅 Python 3 标准库，无需 pip 安装任何东西。
 """
@@ -135,9 +135,6 @@ def _http(method: str, path: str, body=None, headers=None, query=None, timeout=R
 
 
 def get_token():
-    tok = os.environ.get("FREEBUFF_TOKEN")
-    if tok:
-        return tok
     if CRED_FILE.exists():
         cred = json.loads(CRED_FILE.read_text())
         # 兼容旧格式 {"default": {...}}
@@ -313,9 +310,8 @@ def cmd_login(args):
                     f"账号：`{email}`\n"
                     f"id：`{user.get('id')}`\n"
                     f"credits：`{user.get('credits')}`\n\n"
-                    "把下面这行保存到 VPS 的 `credentials/*.json` 或 `FREEBUFF_TOKEN`"
-                    "（多账号则换行追加）：\n"
-                    f"`{auth_token}`"
+                    "请将 freebuff_credentials.json 原样作为 VPS 的 "
+                    "FREEBUFF_CREDENTIALS_JSON 配置。"
                 )
                 if not ok:
                     print("❌ authToken 推送 TG 失败！token 未打印到日志，请检查 TG 配置后重试。")
@@ -323,8 +319,8 @@ def cmd_login(args):
                 print("🔑 authToken 已通过 Telegram 私密发送（未写入日志）。")
             else:
                 mask_value(auth_token)
-                print("\n🔑 把下面这行保存到 VPS 的 credentials/*.json 或 FREEBUFF_TOKEN：")
-                print("    " + auth_token)
+                print("\n🔑 已写入完整 credentials 文件：")
+                print("    " + str(CRED_FILE))
             return user
         elif status == 401:
             print(f"   [{int(time.time()-start)}s] 尚未登录（401），继续等待…")
@@ -343,7 +339,7 @@ def cmd_show(_args):
     """显示全部账号：邮箱 + token（完整显示，本地工具无需脱敏）+ 存活状态（0 消耗 GET /session），末尾汇总一行一个。"""
     pairs = _all_tokens()
     if not pairs:
-        print("❌ 未找到 authToken（先运行 login 或设置 FREEBUFF_TOKEN）")
+        print("❌ 未找到 credentials 文件（先运行 login）")
         sys.exit(1)
     print(f"📋 已保存凭证（{len(pairs)} 个账号）:")
     print("-" * 60)
@@ -353,7 +349,7 @@ def cmd_show(_args):
         print(f"      {at}")
         print(f"      {detail}")
     print("-" * 60)
-    print("\n📋 汇总（一行一个，供 VPS 的 FREEBUFF_TOKEN 使用）:")
+    print("\n📋 当前账号均来自完整 credentials JSON:")
     for _key, at, _email in pairs:
         print(f"   {at}")
     return 0
@@ -498,11 +494,7 @@ def cmd_quota(_args):
 
 
 def _all_tokens():
-    """返回 [(key, token, email)]：优先读取 credentials.json 里的全部账号；未配置则用环境变量。"""
-    tok = os.environ.get("FREEBUFF_TOKEN")
-    if tok:
-        tokens = [value.strip() for value in tok.replace(",", "\n").splitlines() if value.strip()]
-        return [(f"env-{index}", value, "环境变量") for index, value in enumerate(tokens, 1)]
+    """返回 [(key, token, email)]，仅从完整 credentials JSON 读取。"""
     if CRED_FILE.exists():
         try:
             cred = json.loads(CRED_FILE.read_text())
@@ -617,17 +609,14 @@ def _check_one(tok):
 
 
 def cmd_export(_args):
-    """汇总全部账号的 FREEBUFF_TOKEN，一行一个，供 VPS 环境变量使用。"""
-    pairs = _all_tokens()
-    if not pairs:
-        print("❌ 未找到 authToken（先运行 login 或设置 FREEBUFF_TOKEN）")
+    """输出完整 credentials JSON，供 VPS 的 FREEBUFF_CREDENTIALS_JSON 使用。"""
+    if not CRED_FILE.exists():
+        print("❌ 未找到 credentials 文件（先运行 login）")
         sys.exit(1)
-    print("# freebuff2api VPS 变量 FREEBUFF_TOKEN（一行一个账号）")
-    print("# 共 %d 个账号，可写入 .env 或 credentials/*.json" % len(pairs))
+    print("# freebuff2api VPS 变量 FREEBUFF_CREDENTIALS_JSON")
     print("# 注意：本输出含敏感 token，请勿泄露/提交到 git")
     print("=" * 60)
-    for _key, tok, _email in pairs:
-        print(tok)
+    print(CRED_FILE.read_text())
     print("=" * 60)
     return 0
 

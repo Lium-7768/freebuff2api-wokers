@@ -18,7 +18,11 @@ beforeEach(() => {
 
 function env(tokens = [`token-test-${tokenCounter}-aaaaaaaa`]) {
   return {
-    FREEBUFF_TOKEN: tokens.join(','),
+    FREEBUFF_CREDENTIALS_JSON: JSON.stringify(tokens.map((authToken, index) => ({
+      id: `test-account-${index}`,
+      authToken,
+      fingerprintId: `test-fingerprint-${index}`,
+    }))),
     FREEBUFF_API_KEY: API_KEY,
     FREEBUFF_DEBUG: 'false',
   };
@@ -116,7 +120,7 @@ function chatBody(model = 'deepseek/deepseek-v4-flash', extra = {}) {
 }
 
 test('requires an explicitly configured API key', async () => {
-  const response = await worker.fetch(request('/v1/models'), { FREEBUFF_TOKEN: 'token-aaaaaaaa' });
+  const response = await worker.fetch(request('/v1/models'), { FREEBUFF_CREDENTIALS_JSON: JSON.stringify([{ authToken: 'token-aaaaaaaa' }]) });
   assert.equal(response.status, 401);
 });
 
@@ -205,7 +209,7 @@ test('normal chat uses one base3 root and records an accurate completed finish',
   assert.match(chat.body.messages[0].content, /^You are Buffy, the coding agent behind Codebuff\./);
 });
 
-test('main-branch client behavior is opt-in and uses the configured fingerprint', async () => {
+test('main-branch client behavior uses the account fingerprint', async () => {
   const calls = [];
   mockUpstream({ calls });
   const response = await worker.fetch(
@@ -213,7 +217,7 @@ test('main-branch client behavior is opt-in and uses the configured fingerprint'
     {
       ...env(),
       FREEBUFF_CLIENT_BEHAVIOR: 'cli',
-      FREEBUFF_FINGERPRINT_ID: 'fp-test-stable',
+      FREEBUFF_CREDENTIALS_JSON: JSON.stringify([{ authToken: `token-test-${tokenCounter}-aaaaaaaa`, fingerprintId: 'fp-test-stable' }]),
     },
   );
   assert.equal(response.status, 200);
@@ -958,7 +962,7 @@ test('an omitted model follows the CLI selectedModel default to DeepSeek V4 Pro'
   assert.equal(chat.body.model, 'deepseek/deepseek-v4-pro');
 });
 
-test('default CLI request sequence keeps fingerprint only in usage and preserves wire fields', async () => {
+test('default CLI request sequence keeps account fingerprint only in usage and preserves wire fields', async () => {
   const calls = [];
   mockUpstream({ calls });
   const response = await worker.fetch(request('/v1/chat/completions', chatBody()), env());
@@ -975,7 +979,7 @@ test('default CLI request sequence keeps fingerprint only in usage and preserves
   assert.equal(typeof ads.body.sessionId, 'string');
   assert.equal(ads.body.device.os, 'linux');
   assert.match(ads.body.userAgent, /Chrome\/124\.0\.0\.0/);
-  assert.deepEqual(usage.body, { fingerprintId: 'cli-usage' });
+  assert.deepEqual(usage.body, { fingerprintId: 'test-fingerprint-0' });
   assert.equal(usage.headers.authorization, sessionPost.headers.authorization);
   assert.equal(sessionPost.headers['x-freebuff-model'], 'deepseek/deepseek-v4-flash');
   assert.equal(chat.headers['user-agent'], 'ai-sdk/openai-compatible/0.0.149/codebuff');
@@ -1020,6 +1024,55 @@ test("official credentials JSON maps only authToken and usage fingerprintId", as
   }
 });
 
+test("rotates complete accounts and keeps each authToken paired with its fingerprintId", async () => {
+  const calls = [];
+  mockUpstream({ calls });
+  const accountA = {
+    id: `rotation-user-a-${tokenCounter}`,
+    authToken: `rotation-token-a-${tokenCounter}-aaaaaaaa`,
+    fingerprintId: `rotation-fingerprint-a-${tokenCounter}`,
+    email: "must-not-enter-wire-a@example.test",
+  };
+  const accountB = {
+    id: `rotation-user-b-${tokenCounter}`,
+    authToken: `rotation-token-b-${tokenCounter}-bbbbbbbb`,
+    fingerprintId: `rotation-fingerprint-b-${tokenCounter}`,
+    email: "must-not-enter-wire-b@example.test",
+  };
+  const runtime = env([]);
+  runtime.FREEBUFF_CREDENTIALS_JSON = JSON.stringify({
+    accounts: { first: accountA, second: accountB },
+  });
+
+  const first = await worker.fetch(request("/v1/chat/completions", chatBody("deepseek/deepseek-v4-flash", {
+    messages: [{ role: "user", content: "rotation request one" }],
+  })), runtime);
+  const second = await worker.fetch(request("/v1/chat/completions", chatBody("deepseek/deepseek-v4-flash", {
+    messages: [{ role: "user", content: "rotation request two" }],
+  })), runtime);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+
+  const chatCalls = calls.filter((call) => call.path === "/api/v1/chat/completions");
+  assert.equal(chatCalls.length, 2);
+  assert.deepEqual(new Set(chatCalls.map((call) => call.auth)), new Set([
+    `Bearer ${accountA.authToken}`,
+    `Bearer ${accountB.authToken}`,
+  ]));
+
+  const usageByAuth = new Map(calls
+    .filter((call) => call.path === "/api/v1/usage")
+    .map((call) => [call.auth, call.body?.fingerprintId]));
+  assert.equal(usageByAuth.get(`Bearer ${accountA.authToken}`), accountA.fingerprintId);
+  assert.equal(usageByAuth.get(`Bearer ${accountB.authToken}`), accountB.fingerprintId);
+
+  const wire = JSON.stringify(calls);
+  assert.equal(wire.includes(accountA.email), false);
+  assert.equal(wire.includes(accountB.email), false);
+  assert.equal(wire.includes(accountA.id), false);
+  assert.equal(wire.includes(accountB.id), false);
+});
+
 test("invalid or missing official credentials JSON does not create an account", async () => {
   for (const raw of [undefined, "{invalid-json", JSON.stringify({ default: { authToken: "short" } })]) {
     const runtime = env([]);
@@ -1027,4 +1080,17 @@ test("invalid or missing official credentials JSON does not create an account", 
     const response = await worker.fetch(request("/v1/chat/completions", chatBody()), runtime);
     assert.equal(response.status, 503);
   }
+});
+
+test("legacy token and global fingerprint inputs are not accepted", async () => {
+  const tokenOnly = await worker.fetch(request('/v1/chat/completions', chatBody()), {
+    FREEBUFF_TOKEN: 'legacy-token-aaaaaaaa',
+    FREEBUFF_API_KEY: API_KEY,
+  });
+  assert.equal(tokenOnly.status, 503);
+  const fingerprintOnly = await worker.fetch(request('/v1/chat/completions', chatBody()), {
+    FREEBUFF_FINGERPRINT_ID: 'legacy-fingerprint',
+    FREEBUFF_API_KEY: API_KEY,
+  });
+  assert.equal(fingerprintOnly.status, 503);
 });

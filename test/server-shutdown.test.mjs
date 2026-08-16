@@ -121,7 +121,7 @@ test('SIGTERM aborts a request whose FINISH is hanging and still deletes the own
       HOST: '127.0.0.1',
       PORT: String(proxyPort),
       CODEBUFF_API: `http://127.0.0.1:${upstreamPort}`,
-      FREEBUFF_TOKEN: 'token-shutdown-test-aaaaaaaa',
+      FREEBUFF_CREDENTIALS_JSON: JSON.stringify([{ authToken: 'token-shutdown-test-aaaaaaaa', fingerprintId: 'fp-shutdown' }]),
       FREEBUFF_API_KEY: 'shutdown-api-key',
       FREEBUFF_DEBUG: 'false',
       SHUTDOWN_GRACE_MS: '0',
