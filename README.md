@@ -70,27 +70,18 @@ A → B → C → A → B → C
 export FREEBUFF_CREDENTIALS_JSON="$(cat freebuff_tools/freebuff_credentials.json)"
 ```
 
-支持的格式包括官方的 `{accounts:{accountKey:{...}}}`、`{default:{...}}`、JSON 数组，以及每行一个完整账号对象。JSON 数组示例：
+唯一支持的格式是 `{accounts:{accountKey:{...}}}`。单账号也必须放在 `accounts` 中：
 
 ```json
-[
-  {"id":"user-a","authToken":"token-a","fingerprintId":"fp-a"},
-  {"id":"user-b","authToken":"token-b","fingerprintId":"fp-b"}
-]
+{
+  "accounts": {
+    "user-a": {"id":"user-a","authToken":"token-a","fingerprintId":"fp-a"},
+    "user-b": {"id":"user-b","authToken":"token-b","fingerprintId":"fp-b"}
+  }
+}
 ```
 
-也可以使用传统凭证目录；每个文件可直接保存一个完整账号对象：
-
-```text
-credentials/account-a.json
-credentials/account-b.json
-```
-
-若使用官方 CLI 导出的 `{default:{...}}` 凭证容器，也可直接设置 `FREEBUFF_CREDENTIALS_JSON`。适配器只读取其中的 `authToken` 与 `fingerprintId`；`id`、`name`、`email`、`fingerprintHash` 不会加入聊天、session 或 agent-runs 请求：
-
-```bash
-export FREEBUFF_CREDENTIALS_JSON="$(cat credentials/default.json)"
-```
+适配器只读取每个账号的 `authToken` 与 `fingerprintId`；`id`、`name`、`email`、`fingerprintHash` 不会加入聊天、session 或 agent-runs 请求。
 
 其中每个账号的 `fingerprintId` 仅用于该账号的 `/api/v1/usage` body。
 
@@ -187,7 +178,7 @@ Harness 的本地工具仍由 Harness 执行；VPS 只负责上游 session、SSE
 | 变量 | 必需 | 默认值 | 说明 |
 |---|---|---|---|
 | `FREEBUFF_API_KEY` | 是 | 无 | 本服务访问密钥 |
-| `FREEBUFF_CREDENTIALS_JSON` | 是 | 无 | 多账号完整 JSON：官方 `{accounts:{...}}`、`{default:{...}}`、JSON 数组或 JSONL；每个账号的 authToken 与 fingerprintId 成对轮转 |
+| `FREEBUFF_CREDENTIALS_JSON` | 是 | 无 | 唯一支持的多账号 JSON：`{accounts:{accountKey:{authToken,fingerprintId,...}}}`；单账号也必须使用 accounts 容器 |
 | `HOST` | 否 | `0.0.0.0` | 监听地址 |
 | `PORT` | 否 | `8787` | 监听端口 |
 | `CODEBUFF_API` | 否 | `https://www.codebuff.com` | 上游地址 |

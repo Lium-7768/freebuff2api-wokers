@@ -1,6 +1,6 @@
 # Freebuff CLI 0.0.149 请求协议矩阵
 
-本文只记录当前适配器已经按逆向证据落地的外部请求面。**官方 credentials JSON 不是新的上游协议**，而是账号池输入；适配器只从中读取 `authToken` 与 usage 专用 `fingerprintId`。
+本文只记录当前适配器已经按逆向证据落地的外部请求面。**官方 credentials JSON 不是新的上游协议**，而是唯一的账号池输入；适配器只从 `accounts` 容器读取 `authToken` 与 usage 专用 `fingerprintId`。
 
 | 请求 | 方法 | 认证与 User-Agent | 允许的凭证相关字段 | 关键 body/header 边界 |
 |---|---|---|---|---|

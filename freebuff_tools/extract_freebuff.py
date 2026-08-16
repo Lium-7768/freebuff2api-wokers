@@ -137,18 +137,9 @@ def _http(method: str, path: str, body=None, headers=None, query=None, timeout=R
 def get_token():
     if CRED_FILE.exists():
         cred = json.loads(CRED_FILE.read_text())
-        # 兼容旧格式 {"default": {...}}
-        tok = cred.get("authToken")
-        if not tok:
-            tok = cred.get("default", {}).get("authToken")
-        if not tok:
-            # 新格式 {"accounts": {"<key>": {...}}}：取第一个账号
-            accts = cred.get("accounts") or {}
-            for u in accts.values():
-                tok = u.get("authToken")
-                if tok:
-                    break
-        return tok
+        for account in (cred.get("accounts") or {}).values():
+            if account.get("authToken"):
+                return account["authToken"]
     return None
 
 
@@ -165,33 +156,20 @@ def _account_key(user: dict) -> str:
 
 
 def save_credentials(user: dict, append: bool = True):
-    """保存凭证。append=True 时按账号分键追加（不覆盖其他账号）；
-    append=False 时写为 default（兼容旧格式，CI 用）。"""
+    """保存唯一规范格式 {\"accounts\": {account_key: credential}}。"""
     existing = {}
     if CRED_FILE.exists():
         try:
             existing = json.loads(CRED_FILE.read_text())
         except Exception:
             pass
-    if append:
-        # 新格式：accounts 分键，保留已有账号
-        accts = existing.get("accounts")
-        if not isinstance(accts, dict):
-            accts = {}
-            # 迁移旧格式 default → accounts
-            if isinstance(existing.get("default"), dict):
-                accts[_account_key(existing["default"])] = existing["default"]
-            existing = {"accounts": accts}
-        key = _account_key(user)
-        accts[key] = user
-        existing["accounts"] = accts
-    else:
-        # 旧格式：直接覆盖 default（CI 单账号场景）
-        existing["default"] = user
+    accts = existing.get("accounts") if isinstance(existing.get("accounts"), dict) else {}
+    if not append:
+        accts = {}
+    accts[_account_key(user)] = user
+    existing = {"accounts": accts}
     CRED_FILE.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
-    accts = existing.get("accounts")
-    acct_count = len(accts) if isinstance(accts, dict) else (1 if existing.get("default") else 0)
-    print(f"💾 凭证已保存 → {CRED_FILE}（当前 {acct_count} 个账号）")
+    print(f"💾 凭证已保存 → {CRED_FILE}（当前 {len(accts)} 个账号）")
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +276,7 @@ def cmd_login(args):
             mask_value(str(user.get("id", "")))
             print(f"✅ 登录成功! 账号: {email}")
 
-            # 本地运行：分账号追加（不覆盖已有账号）；CI 运行：覆盖 default
+            # 始终保存唯一的 accounts 容器；CI 运行时覆盖已有账号池。
             save_credentials(user, append=not in_ci())
 
             # 关键安全点：CI + 配置了 TG 时，authToken 只推 TG，绝不打印到日志
@@ -503,10 +481,6 @@ def _all_tokens():
         accts = cred.get("accounts")
         if isinstance(accts, dict) and accts:
             return [(k, u.get("authToken", ""), u.get("email", "?")) for k, u in accts.items() if u.get("authToken")]
-        if isinstance(cred.get("default"), dict) and cred["default"].get("authToken"):
-            return [("default", cred["default"]["authToken"], cred["default"].get("email", "?"))]
-        if cred.get("authToken"):
-            return [("default", cred["authToken"], cred.get("email", "?"))]
     return []
 
 

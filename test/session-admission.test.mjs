@@ -20,7 +20,7 @@ function request() {
 }
 
 function env(token) {
-  return { FREEBUFF_CREDENTIALS_JSON: JSON.stringify([{ authToken: token, fingerprintId: "fp-session" }]), FREEBUFF_API_KEY: apiKey, FREEBUFF_DEBUG: "false" };
+  return { FREEBUFF_CREDENTIALS_JSON: JSON.stringify({ accounts: { session: { authToken: token, fingerprintId: "fp-session" } } }), FREEBUFF_API_KEY: apiKey, FREEBUFF_DEBUG: "false" };
 }
 
 function installAdmissionMock(state, status, retryAfterMs) {

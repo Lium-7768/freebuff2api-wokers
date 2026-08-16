@@ -17,12 +17,12 @@ beforeEach(() => {
 });
 
 function env(tokens = [`token-test-${tokenCounter}-aaaaaaaa`]) {
+  const accounts = Object.fromEntries(tokens.map((authToken, index) => [
+    `test-account-${index}`,
+    { id: `test-account-${index}`, authToken, fingerprintId: `test-fingerprint-${index}` },
+  ]));
   return {
-    FREEBUFF_CREDENTIALS_JSON: JSON.stringify(tokens.map((authToken, index) => ({
-      id: `test-account-${index}`,
-      authToken,
-      fingerprintId: `test-fingerprint-${index}`,
-    }))),
+    FREEBUFF_CREDENTIALS_JSON: JSON.stringify({ accounts }),
     FREEBUFF_API_KEY: API_KEY,
     FREEBUFF_DEBUG: 'false',
   };
@@ -120,7 +120,7 @@ function chatBody(model = 'deepseek/deepseek-v4-flash', extra = {}) {
 }
 
 test('requires an explicitly configured API key', async () => {
-  const response = await worker.fetch(request('/v1/models'), { FREEBUFF_CREDENTIALS_JSON: JSON.stringify([{ authToken: 'token-aaaaaaaa' }]) });
+  const response = await worker.fetch(request('/v1/models'), { FREEBUFF_CREDENTIALS_JSON: JSON.stringify({ accounts: { test: { authToken: 'token-aaaaaaaa', fingerprintId: 'fp-test' } } }) });
   assert.equal(response.status, 401);
 });
 
@@ -217,7 +217,7 @@ test('main-branch client behavior uses the account fingerprint', async () => {
     {
       ...env(),
       FREEBUFF_CLIENT_BEHAVIOR: 'cli',
-      FREEBUFF_CREDENTIALS_JSON: JSON.stringify([{ authToken: `token-test-${tokenCounter}-aaaaaaaa`, fingerprintId: 'fp-test-stable' }]),
+      FREEBUFF_CREDENTIALS_JSON: JSON.stringify({ accounts: { test: { authToken: `token-test-${tokenCounter}-aaaaaaaa`, fingerprintId: 'fp-test-stable' } } }),
     },
   );
   assert.equal(response.status, 200);
@@ -997,13 +997,15 @@ test("official credentials JSON maps only authToken and usage fingerprintId", as
   const calls = [];
   mockUpstream({ calls });
   const credentials = {
-    default: {
-      id: "official-user-42",
-      name: "official-name-must-not-leak",
-      email: "official-email-must-not-leak@example.test",
-      authToken: "official-token-aaaaaaaa",
-      fingerprintId: "enhanced-official-fingerprint",
-      fingerprintHash: "official-hash-must-not-leak",
+    accounts: {
+      official: {
+        id: "official-user-42",
+        name: "official-name-must-not-leak",
+        email: "official-email-must-not-leak@example.test",
+        authToken: "official-token-aaaaaaaa",
+        fingerprintId: "enhanced-official-fingerprint",
+        fingerprintHash: "official-hash-must-not-leak",
+      },
     },
   };
   const runtime = env([]);
@@ -1017,10 +1019,10 @@ test("official credentials JSON maps only authToken and usage fingerprintId", as
   assert.equal(agentRuns.some((call) => Object.hasOwn(call.headers, "x-freebuff-acting-user-id")), false);
   for (const call of calls) {
     const requestWire = JSON.stringify({ headers: call.headers, body: call.body });
-    assert.equal(requestWire.includes(credentials.default.id), false);
-    assert.equal(requestWire.includes(credentials.default.name), false);
-    assert.equal(requestWire.includes(credentials.default.email), false);
-    assert.equal(requestWire.includes(credentials.default.fingerprintHash), false);
+    assert.equal(requestWire.includes(credentials.accounts.official.id), false);
+    assert.equal(requestWire.includes(credentials.accounts.official.name), false);
+    assert.equal(requestWire.includes(credentials.accounts.official.email), false);
+    assert.equal(requestWire.includes(credentials.accounts.official.fingerprintHash), false);
   }
 });
 
@@ -1073,8 +1075,8 @@ test("rotates complete accounts and keeps each authToken paired with its fingerp
   assert.equal(wire.includes(accountB.id), false);
 });
 
-test("invalid or missing official credentials JSON does not create an account", async () => {
-  for (const raw of [undefined, "{invalid-json", JSON.stringify({ default: { authToken: "short" } })]) {
+test("invalid or non-canonical credentials JSON does not create an account", async () => {
+  for (const raw of [undefined, "{invalid-json", JSON.stringify({ default: { authToken: "short" } }), JSON.stringify([{ authToken: "token-aaaaaaaa", fingerprintId: "fp" }]), JSON.stringify({ accounts: { only: { authToken: "token-aaaaaaaa" } } })]) {
     const runtime = env([]);
     if (raw !== undefined) runtime.FREEBUFF_CREDENTIALS_JSON = raw;
     const response = await worker.fetch(request("/v1/chat/completions", chatBody()), runtime);

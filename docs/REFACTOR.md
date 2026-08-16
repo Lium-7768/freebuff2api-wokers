@@ -26,7 +26,7 @@
 
 ## 多账号是项目扩展，不是官方 CLI 行为
 
-官方 CLI 使用单个 credentials/default 账号。本项目保留多账号池是明确的产品需求，不能称为“完全复刻官方 CLI”。
+官方 CLI 使用单个账号；本项目统一使用 `accounts` 容器承载一个或多个账号。多账号轮询是明确的产品扩展，不能称为“完全复刻官方 CLI”。
 
 当前实现避免以下问题：
 
@@ -59,7 +59,7 @@ Codex 工具仍由 Codex 客户端执行；适配器只负责正确传递 tool c
 
 ## 本轮协议对比交付（Freebuff CLI 0.0.149）
 
-本轮对照逆向审计补齐了三项可直接由证据支持的差异。第一，将 CLI User-Agent、`x-freebuff-model`、`x-freebuff-instance-id` 和 chat Authorization/Content-Type 组装集中到协议 helper，避免 session、chat、ads/usage 请求之间发生 header 漂移；fingerprintId 仍不加入普通 chat/session/agent-runs 请求。第二，usage 的 fingerprint fallback 从 adapter 自定义的稳定硬件样式改为官方观察到的 `cli-usage`，仅当账号 credentials 缺失 fingerprintId 时使用。第三，session admission 的 `waiting_room_queued` 进入正式状态表，已确认 gate 现在按 HTTP 状态和 JSON status 原样返回，带 `Retry-After` 时向下游保留，并且不会错误 fan-out 到其他账号。
+本轮对照逆向审计补齐了三项可直接由证据支持的差异。第一，将 CLI User-Agent、`x-freebuff-model`、`x-freebuff-instance-id` 和 chat Authorization/Content-Type 组装集中到协议 helper，避免 session、chat、ads/usage 请求之间发生 header 漂移；fingerprintId 仍不加入普通 chat/session/agent-runs 请求。第二，usage 只使用 `accounts.<key>.fingerprintId`，不再提供缺失字段的 fallback。第三，session admission 的 `waiting_room_queued` 进入正式状态表，已确认 gate 现在按 HTTP 状态和 JSON status 原样返回，带 `Retry-After` 时向下游保留，并且不会错误 fan-out 到其他账号。
 
 本轮新增官方 credentials JSON 映射：`authToken` 进入 Bearer；该账号的 `fingerprintId` 仅进入 `/api/v1/usage` body；`id`、`name`、`email`、`fingerprintHash` 不会被加入 prompt 协议字段。适配器不再接受传统 `FREEBUFF_TOKEN` 或全局 `FREEBUFF_FINGERPRINT_ID` 配置，避免账号字段脱钩。
 报告确认的可选 `x-freebuff-acting-user-id` 只在显式配置 `FREEBUFF_ACTING_USER_ID` 时发送到 agent-runs START/FINISH；adapter 不从 token、fingerprint 或随机值推导 userId。未配置时不会发送该 header。

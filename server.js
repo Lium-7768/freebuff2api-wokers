@@ -1,9 +1,6 @@
 import { createServer } from 'node:http';
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 // Load worker module
 const worker = await import('./worker.js');
@@ -26,39 +23,7 @@ function readRuntimeSecret(name) {
   }
 }
 
-// Read complete account JSON documents from credentials/. They are preserved
-// so account-specific fingerprintId values are not discarded.
-const credDir = resolve(__dirname, "credentials");
-const credentialDocuments = [];
-if (existsSync(credDir)) {
-  for (const f of readdirSync(credDir)) {
-    if (!f.endsWith(".json")) continue;
-    try {
-      const raw = readFileSync(resolve(credDir, f), "utf-8");
-      const obj = JSON.parse(raw);
-      if (obj && typeof obj === "object") credentialDocuments.push(obj);
-    } catch (err) {
-      console.error(`[server] skip bad credential ${f}: ${err.message}`);
-    }
-  }
-}
-
 const credentialsJson = readRuntimeSecret("upstream_credentials_json") || process.env.FREEBUFF_CREDENTIALS_JSON || "";
-let credentialSourceJson = credentialsJson;
-if (credentialDocuments.length > 0) {
-  try {
-    // Preserve complete account records from credentials/*.json. If an
-    // explicit JSON secret is also configured, combine both documents; the
-    // worker deduplicates by authToken and keeps the matching fingerprintId.
-    const configured = credentialsJson ? JSON.parse(credentialsJson) : null;
-    const documents = configured === null ? credentialDocuments : [configured, ...credentialDocuments];
-    credentialSourceJson = JSON.stringify(documents.length === 1 ? documents[0] : documents);
-  } catch {
-    // Keep an explicitly supplied value unchanged if it is malformed so the
-    // worker can return a clear credentials configuration error.
-    credentialSourceJson = credentialsJson;
-  }
-}
 
 const apiKey = String(readRuntimeSecret("api_key") || process.env.FREEBUFF_API_KEY || "").trim();
 if (!apiKey) {
@@ -69,7 +34,7 @@ if (String(process.env.FREEBUFF_TOKEN || "").trim() || String(process.env.FREEBU
 }
 
 const env = {
-  FREEBUFF_CREDENTIALS_JSON: credentialSourceJson,
+  FREEBUFF_CREDENTIALS_JSON: credentialsJson,
   FREEBUFF_API_KEY: apiKey,
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || "false",
   FREEBUFF_CLIENT_BEHAVIOR: process.env.FREEBUFF_CLIENT_BEHAVIOR || "cli",
@@ -85,7 +50,7 @@ const env = {
 const shutdownSignalController = new AbortController();
 env.SHUTDOWN_SIGNAL = shutdownSignalController.signal;
 
-console.log(`[server] start: ${credentialDocuments.length + (credentialsJson ? 1 : 0)} credential sources, apiKeyConfigured=true, debug=${env.FREEBUFF_DEBUG}`);
+console.log(`[server] start: ${credentialsJson ? 1 : 0} credential document, apiKeyConfigured=true, debug=${env.FREEBUFF_DEBUG}`);
 if (env.CODEBUFF_API) console.log('[server] CODEBUFF_API configured');
 
 // === HTTP server ===

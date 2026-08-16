@@ -13,5 +13,3 @@ services:
       - FREEBUFF_API_KEY=${FREEBUFF_API_KEY:?FREEBUFF_API_KEY is required}
       - FREEBUFF_CREDENTIALS_JSON=${FREEBUFF_CREDENTIALS_JSON:?FREEBUFF_CREDENTIALS_JSON is required}
       - FREEBUFF_DEBUG=false
-    volumes:
-      - ./credentials:/app/credentials:ro

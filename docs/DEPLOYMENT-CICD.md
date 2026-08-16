@@ -15,7 +15,7 @@
 | `DEPLOY_SSH_PRIVATE_KEY` | 专用部署私钥全文 | 只能使用 forced-command 部署入口。 |
 | `DEPLOY_SSH_KNOWN_HOSTS` | VPS 的 SSH 主机指纹行 | 防止连接到伪造主机。 |
 | `FREEBUFF_API_KEY` | 对外适配器访问密钥 | 仅在部署时传送给 VPS。 |
-| `FREEBUFF_CREDENTIALS_JSON` | 官方 `{accounts:{...}}`、`{default:{...}}` 或 JSON 数组；每个对象包含 `authToken` 与对应 `fingerprintId` | Actions 在标准输入传输前仅在 runner 内 Base64 编码；VPS 仅写入 root-only secret 文件。 |
+| `FREEBUFF_CREDENTIALS_JSON` | 唯一支持的 `{accounts:{accountKey:{authToken,fingerprintId,...}}}` JSON；单账号也必须使用 `accounts` 容器 | Actions 在标准输入传输前仅在 runner 内 Base64 编码；VPS 仅写入 root-only secret 文件。 |
 
 ## VPS 的秘密边界
 
