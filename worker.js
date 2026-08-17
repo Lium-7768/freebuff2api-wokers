@@ -278,7 +278,7 @@ function parseOfficialCredentials(raw) {
 
 function parseAccounts(env) {
   // The only accepted credential document is:
-  // { "accounts": { "account-key": { authToken, fingerprintId, ... } } }.
+  // { "accounts": { "account-key": { authToken, fingerprintId } } }.
   // Each normalized record keeps authToken and its matching fingerprintId together.
   const seen = new Set();
   const accounts = [];

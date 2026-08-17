@@ -9,9 +9,9 @@ const closeOwnedSessions = worker.closeOwnedSessions;
 
 // === Build env from config ===
 
-// Production may mount root-owned one-secret-per-file runtime secrets.  The
-// environment-variable and credentials-directory fallbacks remain for local
-// development only; no secret values are logged.
+// Production may mount root-owned one-secret-per-file runtime secrets. The
+// environment-variable fallback remains for local development only; no secret
+// values are logged.
 const runtimeSecretsDir = String(process.env.FREEBUFF_SECRETS_DIR || '').trim();
 function readRuntimeSecret(name) {
   if (!runtimeSecretsDir) return '';
