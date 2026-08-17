@@ -1076,7 +1076,7 @@ test("rotates complete accounts and keeps each authToken paired with its fingerp
 });
 
 test("invalid or non-canonical credentials JSON does not create an account", async () => {
-  for (const raw of [undefined, "{invalid-json", JSON.stringify({ default: { authToken: "short" } }), JSON.stringify([{ authToken: "token-aaaaaaaa", fingerprintId: "fp" }]), JSON.stringify({ accounts: { only: { authToken: "token-aaaaaaaa" } } })]) {
+  for (const raw of [undefined, "{invalid-json", JSON.stringify({ default: { authToken: "short" } }), JSON.stringify([{ authToken: "token-aaaaaaaa", fingerprintId: "fp" }]), JSON.stringify({ accounts: { only: { authToken: "token-aaaaaaaa" } } }), JSON.stringify({ extra: true, accounts: { only: { authToken: "token-aaaaaaaa", fingerprintId: "fp" } } })]) {
     const runtime = env([]);
     if (raw !== undefined) runtime.FREEBUFF_CREDENTIALS_JSON = raw;
     const response = await worker.fetch(request("/v1/chat/completions", chatBody()), runtime);

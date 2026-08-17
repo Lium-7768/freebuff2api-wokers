@@ -272,6 +272,8 @@ function parseOfficialCredentials(raw) {
     parsed = JSON.parse(raw);
   } catch { return []; }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  const topLevelKeys = Object.keys(parsed);
+  if (topLevelKeys.length !== 1 || topLevelKeys[0] !== "accounts") return [];
   if (!parsed.accounts || typeof parsed.accounts !== "object" || Array.isArray(parsed.accounts)) return [];
   const entries = Object.values(parsed.accounts);
   if (entries.length === 0) return [];
