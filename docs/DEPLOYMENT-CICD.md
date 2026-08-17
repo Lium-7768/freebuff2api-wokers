@@ -15,7 +15,7 @@
 | `DEPLOY_SSH_PRIVATE_KEY` | 专用部署私钥全文 | 只能使用 forced-command 部署入口。 |
 | `DEPLOY_SSH_KNOWN_HOSTS` | VPS 的 SSH 主机指纹行 | 防止连接到伪造主机。 |
 | `FREEBUFF_API_KEY` | 对外适配器访问密钥 | 仅在部署时传送给 VPS。 |
-| `FREEBUFF_CREDENTIALS_JSON` | 唯一支持的 `{accounts:{accountKey:{authToken,fingerprintId,...}}}` JSON；单账号也必须使用 `accounts` 容器 | Actions 在标准输入传输前仅在 runner 内 Base64 编码；VPS 仅写入 root-only secret 文件。 |
+| `FREEBUFF_CREDENTIALS_JSON` | 唯一支持的 `{accounts:{accountKey:{authToken,fingerprintId}}}` JSON；单账号也必须使用 `accounts` 容器 | Actions 在标准输入传输前仅在 runner 内 Base64 编码；VPS 仅写入 root-only secret 文件。 |
 
 ## VPS 的秘密边界
 
@@ -24,7 +24,7 @@
 - `api_key`
 - `upstream_credentials_json`（使用官方 credentials JSON 时）
 
-目录由 root 管理，部署账号没有交互 shell 且只能运行受限命令。容器把该目录只读挂载到 `/run/freebuff2api`，以 `FREEBUFF_SECRETS_DIR=/run/freebuff2api` 读取；不会把应用秘密写入镜像或 Git 工作树。适配器支持多个完整账号对象并按配置顺序轮询；每个账号的 `authToken` 与 `fingerprintId` 保持配对。官方 JSON 中只有 `authToken` 与 usage 专用 `fingerprintId` 进入运行时协议，`name`、`email`、`fingerprintHash` 不会被发送。
+目录由 root 管理，部署账号没有交互 shell 且只能运行受限命令。容器把该目录只读挂载到 `/run/freebuff2api`，以 `FREEBUFF_SECRETS_DIR=/run/freebuff2api` 读取；不会把应用秘密写入镜像、Git 工作树或普通部署日志。适配器支持多个账号对象并按配置顺序轮询；每个账号只使用成对的 `authToken` 与 `fingerprintId`。
 
 为读取宿主机的 `0400 root:root` secrets 文件，服务进程在容器内以 UID 0 运行；启动参数同时删除全部 Linux capabilities 并启用 `no-new-privileges`，从而仅保留读取只读挂载所需的最小权限。
 `/run` 是临时文件系统。若 VPS 重启，服务不会带着旧 token 自动恢复，必须通过 GitHub Actions 再部署一次；这是本设计刻意避免在 VPS 上持久保存应用 secrets 的代价。

@@ -61,7 +61,7 @@ Codex 工具仍由 Codex 客户端执行；适配器只负责正确传递 tool c
 
 本轮对照逆向审计补齐了三项可直接由证据支持的差异。第一，将 CLI User-Agent、`x-freebuff-model`、`x-freebuff-instance-id` 和 chat Authorization/Content-Type 组装集中到协议 helper，避免 session、chat、ads/usage 请求之间发生 header 漂移；fingerprintId 仍不加入普通 chat/session/agent-runs 请求。第二，usage 只使用 `accounts.<key>.fingerprintId`，不再提供缺失字段的 fallback。第三，session admission 的 `waiting_room_queued` 进入正式状态表，已确认 gate 现在按 HTTP 状态和 JSON status 原样返回，带 `Retry-After` 时向下游保留，并且不会错误 fan-out 到其他账号。
 
-本轮新增官方 credentials JSON 映射：`authToken` 进入 Bearer；该账号的 `fingerprintId` 仅进入 `/api/v1/usage` body；`id`、`name`、`email`、`fingerprintHash` 不会被加入 prompt 协议字段。适配器不再接受传统 `FREEBUFF_TOKEN` 或全局 `FREEBUFF_FINGERPRINT_ID` 配置，避免账号字段脱钩。
+本轮新增规范 credentials JSON 映射：每个 `accounts.<key>` 只保留 `authToken` 与 `fingerprintId`；`authToken` 进入 Bearer，`fingerprintId` 仅进入 `/api/v1/usage` body。官方 CLI 的 `id`、`name`、`email`、`fingerprintHash` 不需要复制到 VPS 配置。适配器不再接受传统 `FREEBUFF_TOKEN` 或全局 `FREEBUFF_FINGERPRINT_ID` 配置，避免账号字段脱钩。
 报告确认的可选 `x-freebuff-acting-user-id` 只在显式配置 `FREEBUFF_ACTING_USER_ID` 时发送到 agent-runs START/FINISH；adapter 不从 token、fingerprint 或随机值推导 userId。未配置时不会发送该 header。
 
 新增回归覆盖了精确 chat/session headers、usage `cli-usage` fallback、显式 acting-user、以及双账号场景下 session gate 的 terminal 语义。当前仍明确不实现 `/api/v1/token-count`（bundle 只有设计注释，没有可执行 fetch），不移植官方本地工具执行器，也不伪造 credits 或风控字段。

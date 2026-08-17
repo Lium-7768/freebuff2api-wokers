@@ -24,7 +24,7 @@ POST /api/auth/cli/code
 GET  /api/auth/cli/status
 ```
 
-登录使用 fingerprintId/fingerprintHash，成功后保存完整 credentials。当前适配器只读取 authToken，不实现登录。
+登录使用 fingerprintId/fingerprintHash，成功后保存完整 credentials。当前适配器不实现登录；VPS 配置只保留 authToken 与对应 fingerprintId。
 
 ### Session
 

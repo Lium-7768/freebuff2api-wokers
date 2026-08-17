@@ -75,13 +75,13 @@ export FREEBUFF_CREDENTIALS_JSON="$(cat freebuff_tools/freebuff_credentials.json
 ```json
 {
   "accounts": {
-    "user-a": {"id":"user-a","authToken":"token-a","fingerprintId":"fp-a"},
-    "user-b": {"id":"user-b","authToken":"token-b","fingerprintId":"fp-b"}
+    "user-a": {"authToken":"token-a","fingerprintId":"fp-a"},
+    "user-b": {"authToken":"token-b","fingerprintId":"fp-b"}
   }
 }
 ```
 
-适配器只读取每个账号的 `authToken` 与 `fingerprintId`；`id`、`name`、`email`、`fingerprintHash` 不会加入聊天、session 或 agent-runs 请求。
+每个账号只需要 `authToken` 与 `fingerprintId` 两个字段；其他官方 CLI 元数据不需要复制到 VPS 配置。
 
 其中每个账号的 `fingerprintId` 仅用于该账号的 `/api/v1/usage` body。
 

@@ -583,14 +583,28 @@ def _check_one(tok):
 
 
 def cmd_export(_args):
-    """输出完整 credentials JSON，供 VPS 的 FREEBUFF_CREDENTIALS_JSON 使用。"""
+    """输出仅含 authToken/fingerprintId 的规范 JSON，供 VPS 使用。"""
     if not CRED_FILE.exists():
         print("❌ 未找到 credentials 文件（先运行 login）")
         sys.exit(1)
+    source = json.loads(CRED_FILE.read_text())
+    accounts = source.get("accounts")
+    if not isinstance(accounts, dict) or not accounts:
+        print("❌ credentials 文件必须是 accounts 容器")
+        sys.exit(1)
+    canonical = {"accounts": {}}
+    for key, account in accounts.items():
+        if not isinstance(account, dict) or not account.get("authToken") or not account.get("fingerprintId"):
+            print(f"❌ 账号 {key} 缺少 authToken 或 fingerprintId")
+            sys.exit(1)
+        canonical["accounts"][key] = {
+            "authToken": account["authToken"],
+            "fingerprintId": account["fingerprintId"],
+        }
     print("# freebuff2api VPS 变量 FREEBUFF_CREDENTIALS_JSON")
     print("# 注意：本输出含敏感 token，请勿泄露/提交到 git")
     print("=" * 60)
-    print(CRED_FILE.read_text())
+    print(json.dumps(canonical, indent=2, ensure_ascii=False))
     print("=" * 60)
     return 0
 

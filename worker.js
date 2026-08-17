@@ -260,7 +260,6 @@ function normalizeCredentialObject(credential) {
   if (token.length <= 8 || !fingerprintId) return null;
   return {
     token,
-    uid: typeof credential.id === "string" && credential.id.trim() ? credential.id.trim() : null,
     // Keep the fingerprint on the same account record as authToken.
     fingerprintId,
   };
@@ -286,8 +285,6 @@ function parseAccounts(env) {
   for (const credential of parseOfficialCredentials(env.FREEBUFF_CREDENTIALS_JSON)) {
     const existing = accounts.find((account) => account.token === credential.token);
     if (existing) {
-      if (!existing.uid && credential.uid) existing.uid = credential.uid;
-      if (!existing.fingerprintId && credential.fingerprintId) existing.fingerprintId = credential.fingerprintId;
       continue;
     }
     accounts.push(credential);
