@@ -39,6 +39,7 @@ jobs:
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       FREEBUFF_API_KEY: ${{ secrets.FREEBUFF_API_KEY }}
       FREEBUFF_CREDENTIALS_JSON: ${{ secrets.FREEBUFF_CREDENTIALS_JSON }}
+      FREEBUFF_OPENAI_RESPONSE_COMPAT: ${{ secrets.FREEBUFF_OPENAI_RESPONSE_COMPAT }}
       DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
       DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
     steps:
@@ -73,6 +74,9 @@ jobs:
             printf 'FREEBUFF_API_KEY=%s\n' "$FREEBUFF_API_KEY"
             if [[ -n "$FREEBUFF_CREDENTIALS_JSON" ]]; then
               printf "FREEBUFF_CREDENTIALS_JSON_B64=%s\n" "$(printf "%s" "$FREEBUFF_CREDENTIALS_JSON" | base64 -w0)"
+            fi
+            if [[ -n "$FREEBUFF_OPENAI_RESPONSE_COMPAT" ]]; then
+              printf "FREEBUFF_OPENAI_RESPONSE_COMPAT=%s\n" "$FREEBUFF_OPENAI_RESPONSE_COMPAT"
             fi
           } | ssh -i "$HOME/.ssh/freebuff2api_deploy" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
