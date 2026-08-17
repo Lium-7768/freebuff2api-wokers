@@ -273,7 +273,11 @@ function parseOfficialCredentials(raw) {
   } catch { return []; }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
   if (!parsed.accounts || typeof parsed.accounts !== "object" || Array.isArray(parsed.accounts)) return [];
-  return Object.values(parsed.accounts).map(normalizeCredentialObject).filter(Boolean);
+  const entries = Object.values(parsed.accounts);
+  if (entries.length === 0) return [];
+  const normalized = entries.map(normalizeCredentialObject);
+  if (normalized.some((credential) => !credential)) return [];
+  return normalized;
 }
 
 function parseAccounts(env) {

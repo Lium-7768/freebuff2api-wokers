@@ -1084,6 +1084,17 @@ test("invalid or non-canonical credentials JSON does not create an account", asy
   }
 });
 
+test("mixed valid and invalid accounts fail closed", async () => {
+  const runtime = env([]);
+  runtime.FREEBUFF_CREDENTIALS_JSON = JSON.stringify({
+    accounts: {
+      valid: { authToken: "token-valid-aaaaaaaa", fingerprintId: "fp-valid" },
+      invalid: { authToken: "token-invalid-aaaaaaaa" },
+    },
+  });
+  const response = await worker.fetch(request("/v1/chat/completions", chatBody()), runtime);
+  assert.equal(response.status, 503);
+});
 test("legacy token and global fingerprint inputs are not accepted", async () => {
   const tokenOnly = await worker.fetch(request('/v1/chat/completions', chatBody()), {
     FREEBUFF_TOKEN: 'legacy-token-aaaaaaaa',
