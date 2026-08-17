@@ -1,6 +1,6 @@
 # freebuff2api-wokers
 
-运行在自有 VPS 上的 Freebuff OpenAI/Anthropic 兼容适配器。
+运行在自有 VPS 上的 Freebuff OpenAI/Anthropic 兼容适配器
 
 > 当前基线：Freebuff CLI `0.0.149`、base3、VPS Node.js 单进程。
 
