@@ -1108,7 +1108,7 @@ test("legacy token and global fingerprint inputs are not accepted", async () => 
   assert.equal(fingerprintOnly.status, 503);
 });
 
-test('Chat Completions keeps OpenAI compatibility enabled by default', async () => {
+test('Chat Completions preserves upstream fields by default', async () => {
   const calls = [];
   mockUpstream({ calls, onChat: () => new Response(
     `data: ${JSON.stringify({ id: 'chat-default', model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { reasoning_content: 'think' }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: 'chat-default', model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: 'answer' }, finish_reason: 'stop' }], extra_upstream_field: true })}\n\ndata: [DONE]\n\n`,
