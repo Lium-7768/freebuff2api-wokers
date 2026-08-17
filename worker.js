@@ -1425,6 +1425,7 @@ function responsesInputToMessages(input, instructions) {
 // session gate 按官方 error+status wire contract 原样终止，不自动抢 session 或换号。
 async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSignal) {
   const debug = env.FREEBUFF_DEBUG === "true";
+  const openAiCompat = openAiResponseCompatEnabled(env);
   const harnessMode = harnessToolMode(env) || chatParams?.__harness_mode === true;
   const reverseToolAliases = harnessMode ? invertToolAliases() : null;
   const harnessSessionId = harnessMode && typeof chatParams?.__harness_session_id === "string"
@@ -1632,7 +1633,13 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
             { token, model: mc.session, instanceId: sess.instanceId, runId: run.runId, totalSteps: run.totalSteps, steps: run.steps },
             reverseToolAliases,
           );
-          else pipeUpstreamToClient(resp.body, writable, finalizeStream, reverseToolAliases);
+          else pipeUpstreamToClient(
+            resp.body,
+            writable,
+            finalizeStream,
+            openAiCompat ? reverseToolAliases : null,
+            !openAiCompat,
+          );
           return new Response(readable, {
             status: 200,
             headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
@@ -1641,7 +1648,7 @@ async function executeChat(env, chatParams, mc, isStream, mode, requestAbortSign
 
         const result = mode === "responses"
           ? await responsesToNonStream(resp.body, mc, previousResponseId, reverseToolAliases)
-          : await streamToNonStream(resp.body, mc.upstream, reverseToolAliases);
+          : await streamToNonStream(resp.body, mc.upstream, reverseToolAliases, !openAiCompat);
         completeCurrentStep();
         const hasContinuation = mode === "responses"
           ? Array.isArray(result.output) && result.output.some((item) => item && item.type === "function_call")
@@ -2026,7 +2033,7 @@ function openAiToolCalls(toolCalls, reverseToolAliases = null) {
 }
 
 // 流式：把上游 SSE 剥 {data:...} 包装后透传
-function pipeUpstreamToClient(upstreamBody, writable, onComplete, reverseToolAliases = null) {
+function pipeUpstreamToClient(upstreamBody, writable, onComplete, reverseToolAliases = null, preserveUpstream = false) {
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   (async () => {
@@ -2035,6 +2042,15 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, reverseToolAli
     let sawFinish = false;
     let hasToolCalls = false;
     try {
+      if (preserveUpstream) {
+        const reader = upstreamBody.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) await writer.write(value);
+        }
+        return;
+      }
       for await (const event of readUpstreamSse(upstreamBody)) {
         if (event.done) {
           sawDone = true;
@@ -2071,8 +2087,14 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, reverseToolAli
   })();
 }
 
+// Chat Completions 默认保持 OpenAI 兼容输出。关闭时不改写上游 SSE 的 data 对象，
+// 仅保留生命周期管理和错误收尾；用于需要原始 DeepSeek 扩展字段的客户端。
+function openAiResponseCompatEnabled(env) {
+  return String(env?.FREEBUFF_OPENAI_RESPONSE_COMPAT ?? "true").trim().toLowerCase() !== "false";
+}
+
 // 非流式：聚合上游流成 OpenAI 非流式对象
-async function streamToNonStream(upstreamBody, upstreamModel, reverseToolAliases = null) {
+async function streamToNonStream(upstreamBody, upstreamModel, reverseToolAliases = null, preserveUpstream = false) {
   let content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
   let sawDone = false;
   const toolCalls = new Map();
@@ -2096,8 +2118,12 @@ async function streamToNonStream(upstreamBody, upstreamModel, reverseToolAliases
   const mergedToolCalls = openAiToolCalls(toolCalls, reverseToolAliases);
   const msg = { role: "assistant", content: mergedToolCalls.length && !content ? null : content };
   if (mergedToolCalls.length) msg.tool_calls = mergedToolCalls;
-  if (reasoning && !content) { msg.content = reasoning; msg.reasoning_used_as_content = true; }
-  else if (reasoning) msg.reasoning_content = reasoning;
+  if (preserveUpstream) {
+    if (reasoning) msg.reasoning_content = reasoning;
+  } else if (reasoning && !content) {
+    msg.content = reasoning;
+    msg.reasoning_used_as_content = true;
+  } else if (reasoning) msg.reasoning_content = reasoning;
   return {
     id: id || "gen_" + Date.now(),
     object: "chat.completion",

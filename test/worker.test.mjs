@@ -1107,3 +1107,36 @@ test("legacy token and global fingerprint inputs are not accepted", async () => 
   });
   assert.equal(fingerprintOnly.status, 503);
 });
+
+test('Chat Completions keeps OpenAI compatibility enabled by default', async () => {
+  const calls = [];
+  mockUpstream({ calls, onChat: () => new Response(
+    `data: ${JSON.stringify({ id: 'chat-default', model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { reasoning_content: 'think' }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: 'chat-default', model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { content: 'answer' }, finish_reason: 'stop' }], extra_upstream_field: true })}\n\ndata: [DONE]\n\n`,
+    { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+  ) });
+  const response = await worker.fetch(
+    request('/v1/chat/completions', chatBody(undefined, { stream: true })),
+    env(),
+  );
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /"extra_upstream_field":true/);
+  assert.match(text, /data: \[DONE\]/);
+});
+
+test('Chat Completions can preserve upstream SSE when compatibility is disabled', async () => {
+  const calls = [];
+  mockUpstream({ calls, onChat: () => new Response(
+    `data: ${JSON.stringify({ id: 'chat-raw', model: 'deepseek/deepseek-v4-flash', choices: [{ index: 0, delta: { reasoning_content: 'think' }, finish_reason: null }], upstream_marker: 'raw' })}\n\ndata: [DONE]\n\n`,
+    { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+  ) });
+  const runtime = { ...env(), FREEBUFF_OPENAI_RESPONSE_COMPAT: 'false' };
+  const response = await worker.fetch(
+    request('/v1/chat/completions', chatBody(undefined, { stream: true })),
+    runtime,
+  );
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /"upstream_marker":"raw"/);
+  assert.match(text, /data: \[DONE\]/);
+});
