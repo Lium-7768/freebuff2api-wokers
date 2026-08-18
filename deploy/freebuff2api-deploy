@@ -39,6 +39,7 @@ install_secrets() {
       FREEBUFF_API_KEY) target="api_key"; seen_api=1 ;;
       FREEBUFF_CREDENTIALS_JSON_B64) target="upstream_credentials_json"; seen_credentials=1 ;;
       FREEBUFF_OPENAI_RESPONSE_COMPAT) target="openai_response_compat" ;;
+      BAI_API_KEY) target="bai_api_key" ;;
       ORCA_API_KEY) target="orca_api_key" ;;
       CODEBUFF_API) target="codebuff_api" ;;
       *) fail "unknown secret name" ;;
@@ -69,6 +70,9 @@ container_args() {
     extra_env+=(-e "FREEBUFF_OPENAI_RESPONSE_COMPAT=$(cat "$SECRET_DIR/openai_response_compat")")
   fi
   if [[ -f "$SECRET_DIR/orca_api_key" ]]; then
+  if [[ -f "$SECRET_DIR/bai_api_key" ]]; then
+    extra_env+=( -e "BAI_API_KEY=$(cat "$SECRET_DIR/bai_api_key")" )
+  fi
     extra_env+=(-e "ORCA_API_KEY=$(cat "$SECRET_DIR/orca_api_key")")
   fi
   /usr/bin/docker run -d --name "$name" --network host \

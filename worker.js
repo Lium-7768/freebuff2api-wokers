@@ -95,6 +95,9 @@ const STANDARD_MODELS = new Set([
 const ORCA_MODELS = [
   { id: "orca/deepseek/deepseek-v4-flash-free", upstream: "deepseek/deepseek-v4-flash-free", owned_by: "orca" },
 ];
+const BAI_MODELS = [
+  { id: "bai/deepseek-v4-flash", upstream: "deepseek-v4-flash", owned_by: "bai" },
+];
 
 function modelPoolCategory(modelId) {
   if (PREMIUM_QUOTA_MODELS.has(modelId)) return "premium";
@@ -1298,6 +1301,10 @@ function findOrcaModel(modelId) {
   const raw = String(modelId || "").trim();
   return ORCA_MODELS.find((model) => model.id === raw) || null;
 }
+function findBaiModel(modelId) {
+  const raw = String(modelId || "").trim();
+  return BAI_MODELS.find((model) => model.id === raw) || null;
+}
 function orcaRequestParams(params, orcaModel, env) {
   const upstreamParams = { ...params, model: orcaModel.upstream };
   const mode = String(env?.FREEBUFF_ORCA_REQUEST_MODE || "harness-compact")
@@ -1353,6 +1360,29 @@ async function handleOrcaChat(request, env, params, orcaModel) {
   return new Response(response.body, { status: response.status, headers });
 }
 
+async function handleBaiChat(request, env, params, baiModel) {
+  const apiKey = String(env.BAI_API_KEY || "").trim();
+  if (!apiKey) return jsonResponse({ error: { message: "B.AI is not configured", type: "config_error" } }, 503);
+  const base = String(env.BAI_API_BASE || "https://api.b.ai").replace(/\/$/, "");
+  const upstreamParams = { ...params, model: baiModel.upstream };
+  delete upstreamParams.__harness_mode;
+  delete upstreamParams.__harness_session_id;
+  let response;
+  try {
+    response = await fetch(base + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json", "Accept": params.stream ? "text/event-stream" : "application/json" },
+      body: JSON.stringify(upstreamParams),
+      signal: request.signal,
+    });
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    return jsonResponse({ error: { message: "B.AI upstream transport error: " + message, type: "upstream_transport_error" } }, 502);
+  }
+  const headers = { "Cache-Control": params.stream ? "no-cache" : "no-store", ...corsHeaders() };
+  headers["Content-Type"] = params.stream ? "text/event-stream" : (response.headers.get("content-type") || "application/json");
+  return new Response(response.body, { status: response.status, headers });
+}
 async function handleChat(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
@@ -1369,6 +1399,8 @@ async function handleChat(request, env) {
   const requestedModel = params.model || DEFAULT_MODEL;
   const orcaModel = findOrcaModel(requestedModel);
   if (orcaModel) return handleOrcaChat(request, env, params, orcaModel);
+  const baiModel = findBaiModel(requestedModel);
+  if (baiModel) return handleBaiChat(request, env, params, baiModel);
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
   return executeChat(env, params, mc, isStream, "chat", request.signal);
@@ -2515,9 +2547,10 @@ function visibleModelsForAccounts(env) {
 async function handleModels(env) {
   const visibleModels = visibleModelsForAccounts(env);
   const orcaModels = String(env.ORCA_API_KEY || "").trim() ? ORCA_MODELS : [];
+  const baiModels = String(env.BAI_API_KEY || "").trim() ? BAI_MODELS : [];
   return jsonResponse({
     object: "list",
-    data: [...visibleModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })), ...orcaModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by }))],
+    data: [...visibleModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })), ...orcaModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...baiModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by }))],
   }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 

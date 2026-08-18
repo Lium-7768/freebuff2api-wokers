@@ -48,6 +48,8 @@ const env = {
   FREEBUFF_CHAT_SESSION_ID: process.env.FREEBUFF_CHAT_SESSION_ID || "",
   ORCA_API_KEY: readRuntimeSecret("orca_api_key") || process.env.ORCA_API_KEY || "",
   ORCA_API_BASE: process.env.ORCA_API_BASE || "https://api.orcarouter.ai/v1",
+  BAI_API_KEY: readRuntimeSecret("bai_api_key") || process.env.BAI_API_KEY || "",
+  BAI_API_BASE: process.env.BAI_API_BASE || "https://api.b.ai",
   FREEBUFF_ORCA_REQUEST_MODE: process.env.FREEBUFF_ORCA_REQUEST_MODE || "harness-compact",
   CODEBUFF_API: readRuntimeSecret("codebuff_api") || process.env.CODEBUFF_API || "",
 };
