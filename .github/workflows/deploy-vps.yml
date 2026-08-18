@@ -81,10 +81,10 @@ jobs:
               printf "ORCA_API_KEY=%s\n" "$ORCA_API_KEY"
             fi
             if [[ -n "$BAI_API_KEY" ]]; then
+              printf "BAI_API_KEY=%s\n" "$BAI_API_KEY"
+            fi
             if [[ -n "$MANUS_API_KEY" ]]; then
               printf "MANUS_API_KEY=%s\n" "$MANUS_API_KEY"
-            fi
-              printf "BAI_API_KEY=%s\n" "$BAI_API_KEY"
             fi
           } | ssh -i "$HOME/.ssh/freebuff2api_deploy" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \

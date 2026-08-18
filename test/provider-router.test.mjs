@@ -1,0 +1,15 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { resolveProviderModel } from "../src/router.js";
+
+test("routes every supported external provider model", () => {
+  assert.equal(resolveProviderModel("orca/deepseek/deepseek-v4-flash-free").provider, "orca");
+  assert.equal(resolveProviderModel("bai/deepseek-v4-flash").provider, "bai");
+  assert.equal(resolveProviderModel("manus/manus-1.6").provider, "manus");
+  assert.equal(resolveProviderModel("manus/manus-1.6-lite").provider, "manus");
+  assert.equal(resolveProviderModel("deepseek/deepseek-v4-flash").provider, "freebuff");
+});
+
+test("returns null for unknown model", () => {
+  assert.equal(resolveProviderModel("unknown/vendor-model"), null);
+});

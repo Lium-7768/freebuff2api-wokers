@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 // Load worker module
-const worker = await import('./worker.js');
+const worker = await import('./src/gateway.js');
 const handler = worker.default;
 const closeOwnedSessions = worker.closeOwnedSessions;
 
@@ -53,6 +53,7 @@ const env = {
   MANUS_API_BASE: process.env.MANUS_API_BASE || "https://api.manus.ai",
   MANUS_TASK_TIMEOUT_MS: process.env.MANUS_TASK_TIMEOUT_MS || "120000",
   MANUS_POLL_INTERVAL_MS: process.env.MANUS_POLL_INTERVAL_MS || "1500",
+  MANUS_MAX_ESTIMATED_TOKENS: process.env.MANUS_MAX_ESTIMATED_TOKENS || "4500",
   BAI_API_BASE: process.env.BAI_API_BASE || "https://api.b.ai",
   FREEBUFF_ORCA_REQUEST_MODE: process.env.FREEBUFF_ORCA_REQUEST_MODE || "harness-compact",
   CODEBUFF_API: readRuntimeSecret("codebuff_api") || process.env.CODEBUFF_API || "",

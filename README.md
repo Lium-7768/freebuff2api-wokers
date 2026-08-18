@@ -217,3 +217,18 @@ npm run audit:protocol
 ## License
 
 [AGPL-3.0](LICENSE)
+
+## VPS 多厂商架构
+
+当前生产目标只有 VPS Docker，不再使用 Cloudflare Workers 或 Vercel。新的运行入口是 `src/gateway.js`，由 `src/router.js` 解析模型并交给 `src/providers/` 中对应的厂商实现。`src/protocol/` 负责统一的 OpenAI-compatible 输出；根目录的 `worker.js` 仅保留为旧测试和导入路径的兼容 facade。
+
+当前 provider 包括：
+
+| Provider | 模型/协议 |
+|---|---|
+| `freebuff` | Freebuff CLI base3、DeepSeek Flash/Pro 和其他 CLI 模型 |
+| `orca` | Orca Router OpenAI-compatible 模型 |
+| `bai` | B.AI DeepSeek V4 Flash |
+| `manus` | Manus task API 转换为 OpenAI Chat Completions |
+
+新增或修改 provider 时，应先更新对应 `src/providers/<provider>.js`，再通过 `src/router.js` 接入模型目录；HTTP 层不应直接添加厂商分支。�新增或修改 provider 时，应先更新对应 `src/providers/<provider>.js`，再通过。
