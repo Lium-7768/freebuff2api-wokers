@@ -39,6 +39,7 @@ jobs:
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       FREEBUFF_API_KEY: ${{ secrets.FREEBUFF_API_KEY }}
       FREEBUFF_CREDENTIALS_JSON: ${{ secrets.FREEBUFF_CREDENTIALS_JSON }}
+      MANUS_API_KEY: ${{ secrets.MANUS_API_KEY }}
       BAI_API_KEY: ${{ secrets.BAI_API_KEY }}
       ORCA_API_KEY: ${{ secrets.ORCA_API_KEY }}
       DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
@@ -80,6 +81,9 @@ jobs:
               printf "ORCA_API_KEY=%s\n" "$ORCA_API_KEY"
             fi
             if [[ -n "$BAI_API_KEY" ]]; then
+            if [[ -n "$MANUS_API_KEY" ]]; then
+              printf "MANUS_API_KEY=%s\n" "$MANUS_API_KEY"
+            fi
               printf "BAI_API_KEY=%s\n" "$BAI_API_KEY"
             fi
           } | ssh -i "$HOME/.ssh/freebuff2api_deploy" \
