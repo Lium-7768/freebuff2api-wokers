@@ -39,6 +39,7 @@ install_secrets() {
       FREEBUFF_API_KEY) target="api_key"; seen_api=1 ;;
       FREEBUFF_CREDENTIALS_JSON_B64) target="upstream_credentials_json"; seen_credentials=1 ;;
       FREEBUFF_OPENAI_RESPONSE_COMPAT) target="openai_response_compat" ;;
+      ORCA_API_KEY) target="orca_api_key" ;;
       CODEBUFF_API) target="codebuff_api" ;;
       *) fail "unknown secret name" ;;
     esac
@@ -65,7 +66,10 @@ container_args() {
   local name="$1" port="$2" image="$3"
   local -a extra_env=()
   if [[ -f "$SECRET_DIR/openai_response_compat" ]]; then
-    extra_env=(-e "FREEBUFF_OPENAI_RESPONSE_COMPAT=$(cat "$SECRET_DIR/openai_response_compat")")
+    extra_env+=(-e "FREEBUFF_OPENAI_RESPONSE_COMPAT=$(cat "$SECRET_DIR/openai_response_compat")")
+  fi
+  if [[ -f "$SECRET_DIR/orca_api_key" ]]; then
+    extra_env+=(-e "ORCA_API_KEY=$(cat "$SECRET_DIR/orca_api_key")")
   fi
   /usr/bin/docker run -d --name "$name" --network host \
     --user 0:0 \
@@ -100,7 +104,11 @@ deploy_image() {
   [[ -f "$SECRET_DIR/upstream_credentials_json" ]] || fail "runtime credentials JSON not installed"
 
   /usr/bin/docker rm -f "$candidate" >/dev/null 2>&1 || true
-  container_args "$candidate" "$CANDIDATE_PORT" "$image" >/dev/null
+  if ! container_args "$candidate" "$CANDIDATE_PORT" "$image" >/dev/null; then
+    /usr/bin/docker logs --tail 80 "$candidate" >&2 || true
+    /usr/bin/docker rm -f "$candidate" >/dev/null 2>&1 || true
+    fail "candidate container start failed"
+  fi
   if ! wait_for_health "$CANDIDATE_PORT"; then
     /usr/bin/docker logs --tail 80 "$candidate" >&2 || true
     /usr/bin/docker rm -f "$candidate" >/dev/null 2>&1 || true
@@ -114,7 +122,17 @@ deploy_image() {
     /usr/bin/docker rename "$APP_NAME" "$old_name"
   fi
 
-  if ! container_args "$APP_NAME" "$PRODUCTION_PORT" "$image" >/dev/null || ! wait_for_health "$PRODUCTION_PORT"; then
+  if ! container_args "$APP_NAME" "$PRODUCTION_PORT" "$image" >/dev/null; then
+    /usr/bin/docker logs --tail 80 "$APP_NAME" >&2 || true
+    /usr/bin/docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
+    if [[ -n "$old_name" ]]; then
+      /usr/bin/docker rename "$old_name" "$APP_NAME" || true
+      /usr/bin/docker start "$APP_NAME" || true
+    fi
+    fail "production container start failed; rollback attempted"
+  fi
+
+  if ! wait_for_health "$PRODUCTION_PORT"; then
     /usr/bin/docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
     if [[ -n "$old_name" ]]; then
       /usr/bin/docker rename "$old_name" "$APP_NAME" || true

@@ -92,6 +92,9 @@ const STANDARD_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
   "mimo/mimo-v2.5",
 ]);
+const ORCA_MODELS = [
+  { id: "orca/deepseek/deepseek-v4-flash-free", upstream: "deepseek/deepseek-v4-flash-free", owned_by: "orca" },
+];
 
 function modelPoolCategory(modelId) {
   if (PREMIUM_QUOTA_MODELS.has(modelId)) return "premium";
@@ -1291,6 +1294,34 @@ async function resolveModelConfig(modelId) {
   return findModelConfig(modelId);
 }
 
+function findOrcaModel(modelId) {
+  const raw = String(modelId || "").trim();
+  return ORCA_MODELS.find((model) => model.id === raw) || null;
+}
+
+async function handleOrcaChat(request, env, params, orcaModel) {
+  const apiKey = String(env.ORCA_API_KEY || "").trim();
+  if (!apiKey) return jsonResponse({ error: { message: "Orca Router is not configured", type: "config_error" } }, 503);
+  const base = String(env.ORCA_API_BASE || "https://api.orcarouter.ai/v1").replace(/\/$/, "");
+  const upstreamParams = { ...params, model: orcaModel.upstream };
+  delete upstreamParams.__harness_mode;
+  delete upstreamParams.__harness_session_id;
+  let response;
+  try {
+    response = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json", "Accept": params.stream ? "text/event-stream" : "application/json" },
+      body: JSON.stringify(upstreamParams),
+      signal: request.signal,
+    });
+  } catch (error) {
+    return jsonResponse({ error: { message: `Orca upstream transport error: ${error?.message || error}`, type: "upstream_transport_error" } }, 502);
+  }
+  const headers = { "Cache-Control": params.stream ? "no-cache" : "no-store", ...corsHeaders() };
+  headers["Content-Type"] = params.stream ? "text/event-stream" : (response.headers.get("content-type") || "application/json");
+  return new Response(response.body, { status: response.status, headers });
+}
+
 async function handleChat(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
@@ -1305,6 +1336,8 @@ async function handleChat(request, env) {
   if (harnessSessionId) params.__harness_session_id = harnessSessionId;
   const isStream = !!params.stream;
   const requestedModel = params.model || DEFAULT_MODEL;
+  const orcaModel = findOrcaModel(requestedModel);
+  if (orcaModel) return handleOrcaChat(request, env, params, orcaModel);
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
   return executeChat(env, params, mc, isStream, "chat", request.signal);
@@ -2450,9 +2483,10 @@ function visibleModelsForAccounts(env) {
 
 async function handleModels(env) {
   const visibleModels = visibleModelsForAccounts(env);
+  const orcaModels = String(env.ORCA_API_KEY || "").trim() ? ORCA_MODELS : [];
   return jsonResponse({
     object: "list",
-    data: visibleModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
+    data: [...visibleModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })), ...orcaModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by }))],
   }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 
