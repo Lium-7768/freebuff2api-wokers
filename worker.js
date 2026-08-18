@@ -1391,15 +1391,33 @@ async function handleBaiChat(request, env, params, baiModel) {
   headers["Content-Type"] = params.stream ? "text/event-stream" : (response.headers.get("content-type") || "application/json");
   return new Response(response.body, { status: response.status, headers });
 }
-function manusTextFromMessages(messages) {
+function manusTextFromMessages(messages, maxEstimatedTokens = 4500) {
   if (!Array.isArray(messages)) return String(messages || "");
-  return messages.map((message) => {
+  const maxChars = Math.max(4000, Math.min(19200, Number(maxEstimatedTokens || 4500) * 4));
+  const entries = messages.map((message) => {
     const role = String(message?.role || "user");
     let content = message?.content;
     if (Array.isArray(content)) content = content.map((part) => part?.text ?? part?.content ?? "").join("");
     if (content && typeof content === "object") content = JSON.stringify(content);
-    return role + ": " + String(content ?? "");
-  }).join("\n\n");
+    content = String(content ?? "");
+    const block = role + ": " + content;
+    if (block.length <= maxChars) return block;
+    const keepHead = Math.floor(maxChars * 0.72);
+    const keepTail = Math.max(256, maxChars - keepHead - 80);
+    return block.slice(0, keepHead) + " [message content truncated by VPS adapter] " + block.slice(-keepTail);
+  });
+  const selected = [];
+  let used = 0;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const block = entries[index];
+    const extra = block.length + (selected.length ? 2 : 0);
+    if (used + extra > maxChars) break;
+    selected.unshift(block);
+    used += extra;
+  }
+  if (!selected.length && entries.length) selected.unshift(entries.at(-1).slice(-maxChars));
+  if (selected.length < entries.length) selected.unshift("[earlier messages omitted to stay within Manus 5000-token limit]");
+  return selected.join("\n\n");
 }
 function manusDelay(ms, signal) {
   return new Promise((resolve, reject) => {
@@ -1427,7 +1445,8 @@ async function handleManusChat(request, env, params, manusModel) {
   const base = String(env.MANUS_API_BASE || "https://api.manus.ai").replace(/\/$/, "");
   const timeoutMs = Math.max(5000, Number(env.MANUS_TASK_TIMEOUT_MS || 120000));
   const pollMs = Math.max(250, Number(env.MANUS_POLL_INTERVAL_MS || 1500));
-  const content = manusTextFromMessages(params.messages);
+  const maxEstimatedTokens = Math.max(1000, Math.min(4500, Number(env.MANUS_MAX_ESTIMATED_TOKENS || 4500)));
+  const content = manusTextFromMessages(params.messages, maxEstimatedTokens);
   if (!content.trim()) return jsonResponse({ error: { message: "messages cannot be empty", type: "invalid_request_error" } }, 400);
   const headers = { "Content-Type": "application/json", "x-manus-api-key": apiKey };
   let created;
