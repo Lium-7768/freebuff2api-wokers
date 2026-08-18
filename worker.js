@@ -96,6 +96,7 @@ const ORCA_MODELS = [
   { id: "orca/deepseek/deepseek-v4-flash-free", upstream: "deepseek/deepseek-v4-flash-free", owned_by: "orca" },
 ];
 const MANUS_MODELS = [
+  { id: "manus/manus-1.6", upstream: "manus-1.6", owned_by: "manus" },
   { id: "manus/manus-1.6-lite", upstream: "manus-1.6-lite", owned_by: "manus" },
 ];
 const BAI_MODELS = [
