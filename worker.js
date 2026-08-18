@@ -2113,7 +2113,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, reverseToolAli
 // Chat Completions 默认保持 OpenAI 兼容输出。关闭时不改写上游 SSE 的 data 对象，
 // 仅保留生命周期管理和错误收尾；用于需要原始 DeepSeek 扩展字段的客户端。
 function openAiResponseCompatEnabled(env) {
-  return String(env?.FREEBUFF_OPENAI_RESPONSE_COMPAT ?? "false").trim().toLowerCase() !== "false";
+  return String(env?.FREEBUFF_OPENAI_RESPONSE_COMPAT ?? "true").trim().toLowerCase() !== "false";
 }
 
 // 非流式：聚合上游流成 OpenAI 非流式对象
