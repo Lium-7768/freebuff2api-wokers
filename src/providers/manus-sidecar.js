@@ -22,12 +22,32 @@ function textFromContent(content) {
   return String(content ?? "");
 }
 
+function isHarnessInternalContext(text) {
+  const value = String(text || "");
+  return value.startsWith("<system-reminder>")
+    || value.includes("The following workspace instructions may be relevant")
+    || value.includes("Instructions from: AGENTS.md")
+    || value.includes("Current runtime context.")
+    || value.includes("Current DSH file policy:")
+    || value.includes("A skill is a reusable set of task-specific instructions.")
+    || value.includes("<available_skills>")
+    || value.includes("This snapshot supersedes earlier runtime-context");
+}
+
+function humanUserMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .filter((message) => String(message?.role || "") === "user")
+    .map((message) => textFromContent(message.content).trim())
+    .filter((text) => text && !isHarnessInternalContext(text));
+}
+
 function latestUserMessage(messages) {
-  if (!Array.isArray(messages)) return "";
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (String(messages[i]?.role || "") === "user") return textFromContent(messages[i].content).trim();
-  }
-  return "";
+  return humanUserMessages(messages).at(-1) || "";
+}
+
+function firstUserMessage(messages) {
+  return humanUserMessages(messages)[0] || "";
 }
 
 export function promptForManus(params) {
@@ -202,9 +222,13 @@ async function pollAnswer(base, key, record, request, timeoutMs, pollMs) {
 
 function conversationKey(request, params, model) {
   const supplied = request.headers.get("x-deepseek-harness-session-id") || request.headers.get("x-session-id") || request.headers.get("x-conversation-id") || params?.__harness_session_id;
-  if (!supplied) return null;
   const user = request.headers.get("x-deepseek-harness-user-id") || "anonymous";
-  return hash(`${user}:${supplied}:${model.id}`).slice(0, 48);
+  // Harness currently sends its AGENTS/skill/runtime blocks as user messages
+  // and may omit a session header. The first real user turn is stable across
+  // later full-history requests, so use it as a conservative conversation key.
+  const fallback = firstUserMessage(params?.messages);
+  if (!supplied && !fallback) return null;
+  return hash(`${user}:${supplied || fallback}:${model.id}`).slice(0, 48);
 }
 
 async function locked(key, work) {

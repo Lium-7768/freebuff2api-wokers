@@ -41,6 +41,21 @@ test("filters Harness internal instructions and keeps the final user request", (
   assert.match(prompt, /Do not inspect/);
 });
 
+test("ignores Harness internal blocks even when they arrive as user messages", () => {
+  const prompt = promptForManus({
+    __harness_mode: true,
+    messages: [
+      { role: "user", content: "请只回答：真实问题" },
+      { role: "user", content: "<system-reminder>Instructions from: AGENTS.md</system-reminder>" },
+      { role: "user", content: "Current runtime context. Current DSH file policy: workspace-write." },
+      { role: "user", content: "A skill is a reusable set of task-specific instructions.\n<available_skills>..." },
+    ],
+  });
+  assert.match(prompt, /真实问题/);
+  assert.doesNotMatch(prompt, /AGENTS\.md/);
+  assert.doesNotMatch(prompt, /workspace-write/);
+});
+
 test("creates one task, then sends follow-up on the same task", async () => {
   const calls = [];
   const oldFetch = globalThis.fetch;
