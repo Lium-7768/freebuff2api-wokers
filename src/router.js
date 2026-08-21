@@ -5,6 +5,7 @@ const entries = [
   ["orca", providers.orca.models],
   ["bai", providers.bai.models],
   ["manus", providers.manus.models],
+  ["openrouter", providers.openrouter.models],
 ];
 
 export function resolveProviderModel(modelId) {

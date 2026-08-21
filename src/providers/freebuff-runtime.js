@@ -3,6 +3,7 @@ import { resolveProviderModel } from "../router.js";
 import { handleBaiChat } from "./bai.js";
 import { handleOrcaChat } from "./orca.js";
 import { handleManusChat } from "./manus.js";
+import { handleOpenRouterChat } from "./openrouter.js";
 const DEFAULT_CODEBUFF_API = "https://www.codebuff.com";
 let configuredCodebuffApi = DEFAULT_CODEBUFF_API;
 // Freebuff CLI 0.0.149 wire constants. Keep these values centralized so the
@@ -1298,6 +1299,7 @@ async function handleChat(request, env) {
   if (route?.provider === "orca") return handleOrcaChat(request, env, params, route.model);
   if (route?.provider === "manus") return handleManusChat(request, env, params, route.model);
   if (route?.provider === "bai") return handleBaiChat(request, env, params, route.model);
+  if (route?.provider === "openrouter") return handleOpenRouterChat(request, env, params, route.model);
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
   return executeChat(env, params, mc, isStream, "chat", request.signal);
@@ -2446,9 +2448,10 @@ async function handleModels(env) {
   const orcaModels = String(env.ORCA_API_KEY || "").trim() ? providers.orca.models : [];
   const manusModels = String(env.MANUS_API_KEY || "").trim() ? providers.manus.models : [];
   const baiModels = String(env.BAI_API_KEY || "").trim() ? providers.bai.models : [];
+  const openrouterModels = String(env.OPENROUTER_API_KEY || "").trim() ? providers.openrouter.models : [];
   return jsonResponse({
     object: "list",
-    data: [...visibleModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })), ...orcaModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...baiModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...manusModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by }))],
+    data: [...visibleModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })), ...orcaModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...baiModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...manusModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...openrouterModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by }))],
   }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 

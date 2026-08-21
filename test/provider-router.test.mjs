@@ -7,6 +7,7 @@ test("routes every supported external provider model", () => {
   assert.equal(resolveProviderModel("bai/deepseek-v4-flash").provider, "bai");
   assert.equal(resolveProviderModel("manus/manus-1.6").provider, "manus");
   assert.equal(resolveProviderModel("manus/manus-1.6-lite").provider, "manus");
+  assert.equal(resolveProviderModel("openrouter/stealth/ox-alpha").provider, "openrouter");
   assert.equal(resolveProviderModel("deepseek/deepseek-v4-flash").provider, "freebuff");
 });
 
