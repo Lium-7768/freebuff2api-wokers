@@ -41,6 +41,7 @@ jobs:
       FREEBUFF_CREDENTIALS_JSON: ${{ secrets.FREEBUFF_CREDENTIALS_JSON }}
       MANUS_API_KEY: ${{ secrets.MANUS_API_KEY }}
       BAI_API_KEY: ${{ secrets.BAI_API_KEY }}
+      CAI_API_KEY: ${{ secrets.CAI_API_KEY }}
       ORCA_API_KEY: ${{ secrets.ORCA_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
@@ -83,6 +84,9 @@ jobs:
             fi
             if [[ -n "$BAI_API_KEY" ]]; then
               printf "BAI_API_KEY=%s\n" "$BAI_API_KEY"
+            fi
+            if [[ -n "$CAI_API_KEY" ]]; then
+              printf "CAI_API_KEY=%s\n" "$CAI_API_KEY"
             fi
             if [[ -n "$MANUS_API_KEY" ]]; then
               printf "MANUS_API_KEY=%s\n" "$MANUS_API_KEY"

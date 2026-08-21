@@ -41,6 +41,7 @@ install_secrets() {
       FREEBUFF_OPENAI_RESPONSE_COMPAT) target="openai_response_compat" ;;
       MANUS_API_KEY) target="manus_api_key" ;;
       BAI_API_KEY) target="bai_api_key" ;;
+      CAI_API_KEY) target="cai_api_key" ;;
       ORCA_API_KEY) target="orca_api_key" ;;
       OPENROUTER_API_KEY) target="openrouter_api_key" ;;
       CODEBUFF_API) target="codebuff_api" ;;
@@ -76,6 +77,9 @@ container_args() {
   fi
   if [[ -f "$SECRET_DIR/bai_api_key" ]]; then
     extra_env+=( -e "BAI_API_KEY=$(cat "$SECRET_DIR/bai_api_key")" )
+  fi
+  if [[ -f "$SECRET_DIR/cai_api_key" ]]; then
+    extra_env+=( -e "CAI_API_KEY=$(cat "$SECRET_DIR/cai_api_key")" )
   fi
   if [[ -f "$SECRET_DIR/manus_api_key" ]]; then
     extra_env+=( -e "MANUS_API_KEY=$(cat "$SECRET_DIR/manus_api_key")" )

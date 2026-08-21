@@ -4,6 +4,7 @@ const entries = [
   ["freebuff", providers.freebuff.models],
   ["orca", providers.orca.models],
   ["bai", providers.bai.models],
+  ["cai", providers.cai.models],
   ["manus", providers.manus.models],
   ["openrouter", providers.openrouter.models],
 ];

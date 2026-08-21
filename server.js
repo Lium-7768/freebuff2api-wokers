@@ -49,6 +49,8 @@ const env = {
   ORCA_API_KEY: readRuntimeSecret("orca_api_key") || process.env.ORCA_API_KEY || "",
   ORCA_API_BASE: process.env.ORCA_API_BASE || "https://api.orcarouter.ai/v1",
   BAI_API_KEY: readRuntimeSecret("bai_api_key") || process.env.BAI_API_KEY || "",
+  CAI_API_KEY: readRuntimeSecret("cai_api_key") || process.env.CAI_API_KEY || "",
+  CAI_API_BASE: process.env.CAI_API_BASE || "https://api.b.ai",
   OPENROUTER_API_KEY: readRuntimeSecret("openrouter_api_key") || process.env.OPENROUTER_API_KEY || "",
   OPENROUTER_API_BASE: process.env.OPENROUTER_API_BASE || "https://openrouter.ai/api/v1",
   MANUS_API_KEY: readRuntimeSecret("manus_api_key") || process.env.MANUS_API_KEY || "",
