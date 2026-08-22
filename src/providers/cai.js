@@ -2,7 +2,10 @@ import { jsonResponse, corsHeaders } from "../protocol/compat.js";
 
 export const providerId = "cai";
 export const ownedBy = "cai";
-export const models = [{ id: "cai/deepseek-v4-flash", upstream: "deepseek-v4-flash", owned_by: "cai" }];
+export const models = [
+  { id: "cai/deepseek-v4-flash", upstream: "deepseek-v4-flash", owned_by: "cai" },
+  { id: "cai/deepseek-v4-flash-vision-exp", upstream: "deepseek-v4-flash-vision-exp", owned_by: "cai" },
+];
 
 export function isConfigured(env) {
   return Boolean(String(env?.CAI_API_KEY || "").trim());

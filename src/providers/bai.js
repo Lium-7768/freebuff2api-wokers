@@ -1,6 +1,9 @@
 export const providerId = "bai";
 export const ownedBy = "bai";
-export const models = [{ id: "bai/deepseek-v4-flash", upstream: "deepseek-v4-flash", owned_by: "bai" }];
+export const models = [
+  { id: "bai/deepseek-v4-flash", upstream: "deepseek-v4-flash", owned_by: "bai" },
+  { id: "bai/deepseek-v4-flash-vision-exp", upstream: "deepseek-v4-flash-vision-exp", owned_by: "bai" },
+];
 export function isConfigured(env) { return Boolean(String(env?.BAI_API_KEY || "").trim()); }
 export function baseUrl(env) { return String(env?.BAI_API_BASE || "https://api.b.ai").replace(/\/$/, ""); }
 import { jsonResponse, corsHeaders } from "../protocol/compat.js";
