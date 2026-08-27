@@ -7,6 +7,7 @@ const entries = [
   ["cai", providers.cai.models],
   ["manus", providers.manus.models],
   ["openrouter", providers.openrouter.models],
+  ["tokenharbor", providers.tokenharbor.models],
 ];
 
 export function resolveProviderModel(modelId) {

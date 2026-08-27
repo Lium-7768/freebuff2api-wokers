@@ -44,6 +44,7 @@ install_secrets() {
       CAI_API_KEY) target="cai_api_key" ;;
       ORCA_API_KEY) target="orca_api_key" ;;
       OPENROUTER_API_KEY) target="openrouter_api_key" ;;
+      TOKENHARBOR_API_KEY) target="tokenharbor_api_key" ;;
       CODEBUFF_API) target="codebuff_api" ;;
       *) fail "unknown secret name" ;;
     esac
@@ -86,6 +87,9 @@ container_args() {
   fi
   if [[ -f "$SECRET_DIR/openrouter_api_key" ]]; then
     extra_env+=( -e "OPENROUTER_API_KEY=$(cat "$SECRET_DIR/openrouter_api_key")" )
+  fi
+  if [[ -f "$SECRET_DIR/tokenharbor_api_key" ]]; then
+    extra_env+=( -e "TOKENHARBOR_API_KEY=$(cat "$SECRET_DIR/tokenharbor_api_key")" )
   fi
   /usr/bin/docker run -d --name "$name" --network host \
     --user 0:0 \

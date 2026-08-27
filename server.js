@@ -53,6 +53,8 @@ const env = {
   CAI_API_BASE: process.env.CAI_API_BASE || "https://api.b.ai",
   OPENROUTER_API_KEY: readRuntimeSecret("openrouter_api_key") || process.env.OPENROUTER_API_KEY || "",
   OPENROUTER_API_BASE: process.env.OPENROUTER_API_BASE || "https://openrouter.ai/api/v1",
+  TOKENHARBOR_API_KEY: readRuntimeSecret("tokenharbor_api_key") || process.env.TOKENHARBOR_API_KEY || "",
+  TOKENHARBOR_API_BASE: process.env.TOKENHARBOR_API_BASE || "https://tokenharbor.ai/v1",
   MANUS_API_KEY: readRuntimeSecret("manus_api_key") || process.env.MANUS_API_KEY || "",
   MANUS_API_BASE: process.env.MANUS_API_BASE || "https://api.manus.ai",
   MANUS_TASK_TIMEOUT_MS: process.env.MANUS_TASK_TIMEOUT_MS || "120000",

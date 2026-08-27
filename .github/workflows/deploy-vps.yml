@@ -44,6 +44,7 @@ jobs:
       CAI_API_KEY: ${{ secrets.CAI_API_KEY }}
       ORCA_API_KEY: ${{ secrets.ORCA_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      TOKENHARBOR_API_KEY: ${{ secrets.TOKENHARBOR_API_KEY }}
       DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
       DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
     steps:
@@ -93,6 +94,9 @@ jobs:
             fi
             if [[ -n "$OPENROUTER_API_KEY" ]]; then
               printf "OPENROUTER_API_KEY=%s\n" "$OPENROUTER_API_KEY"
+            fi
+            if [[ -n "$TOKENHARBOR_API_KEY" ]]; then
+              printf "TOKENHARBOR_API_KEY=%s\n" "$TOKENHARBOR_API_KEY"
             fi
           } | ssh -i "$HOME/.ssh/freebuff2api_deploy" \
             -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \

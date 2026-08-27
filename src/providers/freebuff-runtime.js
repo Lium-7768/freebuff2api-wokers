@@ -5,6 +5,7 @@ import { handleCaiChat } from "./cai.js";
 import { handleOrcaChat } from "./orca.js";
 import { handleManusChat } from "./manus.js";
 import { handleOpenRouterChat } from "./openrouter.js";
+import { handleTokenHarborChat } from "./tokenharbor.js";
 const DEFAULT_CODEBUFF_API = "https://www.codebuff.com";
 let configuredCodebuffApi = DEFAULT_CODEBUFF_API;
 // Freebuff CLI 0.0.149 wire constants. Keep these values centralized so the
@@ -84,6 +85,7 @@ const STANDARD_MODELS = providers.freebuff.standardModels;
 const ORCA_MODELS = providers.orca.models;
 const MANUS_MODELS = providers.manus.models;
 const BAI_MODELS = providers.bai.models;
+const TOKENHARBOR_MODELS = providers.tokenharbor.models;
 function modelPoolCategory(modelId) {
   if (PREMIUM_QUOTA_MODELS.has(modelId)) return "premium";
   if (STANDARD_MODELS.has(modelId)) return "standard";
@@ -1302,6 +1304,7 @@ async function handleChat(request, env) {
   if (route?.provider === "bai") return handleBaiChat(request, env, params, route.model);
   if (route?.provider === "cai") return handleCaiChat(request, env, params, route.model);
   if (route?.provider === "openrouter") return handleOpenRouterChat(request, env, params, route.model);
+  if (route?.provider === "tokenharbor") return handleTokenHarborChat(request, env, params, route.model);
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
   return executeChat(env, params, mc, isStream, "chat", request.signal);
@@ -2452,9 +2455,10 @@ async function handleModels(env) {
   const baiModels = String(env.BAI_API_KEY || "").trim() ? providers.bai.models : [];
   const caiModels = String(env.CAI_API_KEY || "").trim() ? providers.cai.models : [];
   const openrouterModels = String(env.OPENROUTER_API_KEY || "").trim() ? providers.openrouter.models : [];
+  const tokenharborModels = String(env.TOKENHARBOR_API_KEY || "").trim() ? TOKENHARBOR_MODELS : [];
   return jsonResponse({
     object: "list",
-    data: [...visibleModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })), ...orcaModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...baiModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...caiModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...manusModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...openrouterModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by }))],
+    data: [...visibleModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })), ...orcaModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...baiModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...caiModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...manusModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...openrouterModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by })), ...tokenharborModels.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: m.owned_by }))],
   }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 

@@ -181,13 +181,19 @@ Harness 的本地工具仍由 Harness 执行；VPS 只负责上游 session、SSE
 | `FREEBUFF_CREDENTIALS_JSON` | 是 | 无 | 唯一支持的多账号 JSON：`{accounts:{accountKey:{authToken,fingerprintId,...}}}`；单账号也必须使用 accounts 容器 |
 | `HOST` | 否 | `0.0.0.0` | 监听地址 |
 | `PORT` | 否 | `8787` | 监听端口 |
-| `CODEBUFF_API` | 否 | `https://www.codebuff.com` | 上游地址 |
+| `CODEBUFF_API` | 否 | `https://www.codebuff.com` | Freebuff/Codebuff 上游地址 |
+| `TOKENHARBOR_API_KEY` | 否 | 无 | TokenHarbor API 密钥；配置后开放 TokenHarbor 模型 |
+| `TOKENHARBOR_API_BASE` | 否 | `https://tokenharbor.ai/v1` | TokenHarbor OpenAI-compatible API 地址 |
 | `FREEBUFF_DEBUG` | 否 | `false` | 输出脱敏路由日志 |
 | `FREEBUFF_CLIENT_BEHAVIOR` | 否 | `cli` | `cli` 按报告启用 ads/usage；`off` 显式关闭；`harness` 仅启用 Harness 工具名/多 step 兼容 |
 | `SHUTDOWN_GRACE_MS` | 否 | `5000` | SIGINT/SIGTERM 等待活动 HTTP 请求的毫秒数；可设为 `0` |
 | `SHUTDOWN_CLEANUP_TIMEOUT_MS` | 否 | `5000` | 退出时等待 session DELETE 的毫秒数；可设为 `0` |
 
 `FREEBUFF_TOKEN` 和 `FREEBUFF_FINGERPRINT_ID` 不再支持；服务启动时若检测到这两个变量会直接报错。请使用完整的 `FREEBUFF_CREDENTIALS_JSON`。
+
+### 生产发布中的 provider 密钥
+
+生产发布不把 provider 密钥写入镜像、Compose 文件或仓库。GitHub Actions 从 Production environment 的 `TOKENHARBOR_API_KEY` secret 读取密钥，通过 SSH 标准输入发送给 VPS 的受限 `install-secrets` 命令；VPS 将其保存为 root-only 的 `/run/freebuff2api/tokenharbor_api_key`，启动容器时以 `TOKENHARBOR_API_KEY` 注入。TokenHarbor 的模型只有在该 secret 非空时才会出现在 `/v1/models` 中。当前接入的 Free 模型为 `tokenharbor/qwen3.8-27b:free`、`tokenharbor/deepseek-v4-flash:free` 和 `tokenharbor/mimo-v2.5:free`；免费模型集合以 TokenHarbor 官方 Models 页面为准，可能轮换或下线。
 
 ### VPS 部署边界
 
@@ -230,5 +236,6 @@ npm run audit:protocol
 | `orca` | Orca Router OpenAI-compatible 模型 |
 | `bai` | B.AI DeepSeek V4 Flash |
 | `manus` | Manus task API 转换为 OpenAI Chat Completions |
+| `tokenharbor` | TokenHarbor OpenAI-compatible Chat Completions；当前 Free 模型为 `qwen3.8-27b:free`、`deepseek-v4-flash:free`、`mimo-v2.5:free` |
 
-新增或修改 provider 时，应先更新对应 `src/providers/<provider>.js`，再通过 `src/router.js` 接入模型目录；HTTP 层不应直接添加厂商分支。�新增或修改 provider 时，应先更新对应 `src/providers/<provider>.js`，再通过。
+新增或修改 provider 时，应先更新对应 `src/providers/<provider>.js`，再通过 `src/router.js` 接入模型目录；HTTP 层不应直接添加厂商分支。�新增或修改 provider 时，应先更新对应 `src/providers/<provider>.js`，再通过。
