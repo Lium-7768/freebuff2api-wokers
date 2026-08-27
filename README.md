@@ -236,6 +236,6 @@ npm run audit:protocol
 | `orca` | Orca Router OpenAI-compatible 模型 |
 | `bai` | B.AI DeepSeek V4 Flash |
 | `manus` | Manus task API 转换为 OpenAI Chat Completions |
-| `tokenharbor` | TokenHarbor OpenAI-compatible Chat Completions；当前 Free 模型为 `qwen3.8-27b:free`、`deepseek-v4-flash:free`、`mimo-v2.5:free` |
+| `tokenharbor` | TokenHarbor OpenAI-compatible Chat Completions；公开模型统一使用 `tokenharbor/` 前缀，当前 Free 模型为 `tokenharbor/qwen3.8-27b:free`、`tokenharbor/deepseek-v4-flash:free`、`tokenharbor/mimo-v2.5:free` |
 
 新增或修改 provider 时，应先更新对应 `src/providers/<provider>.js`，再通过 `src/router.js` 接入模型目录；HTTP 层不应直接添加厂商分支。�新增或修改 provider 时，应先更新对应 `src/providers/<provider>.js`，再通过。
